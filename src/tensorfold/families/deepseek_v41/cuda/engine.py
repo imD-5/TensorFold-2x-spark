@@ -83,6 +83,8 @@ class DsEngine:
         nccl = NCCL(rank, world, master, port) if world > 1 else None
         self.nccl = nccl
         self.w = load(model_dir, rank, world, dspark=drafts > 0)
+        from tensorfold.cuda import display_mem
+        display_mem.offload(self.w, log=lambda s: print(s, flush=True))   # TF_DS_DISPLAY_MEM
         cfg = self.w.cfg
         eng = None
         engram_dir = engram_dir or _default_engram(model_dir)
