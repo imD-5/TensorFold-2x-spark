@@ -32,6 +32,9 @@ KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
 # the slot's previous request's keys sit below the floor (prompts of 2048k+112..127 tokens, last chunks of 2-16 rows
 # answered by what ran before). Off (default): the lane's bits. The Zig port's 65f295ec, the same rule.
 REPLAY_FLOOR = os.environ.get("TF_DS_REPLAY_FLOOR", "0") == "1"
+# TF_DS_RS=1: a prompt chunk's attention / MoE partials reach the mHC post as bf16(p0 + p1) from a fp32 reduce-scatter
+# and a bf16 all-gather (Comm.reduced), not as the fp32 gather: the same bits, 3/4 of the bytes on the link
+RS = os.environ.get("TF_DS_RS", "0") == "1"
 
 
 def ring_mode_for(n: int, start: int, floor: int, window: int) -> bool:
@@ -102,7 +105,7 @@ class Comm:
     our RDMA-write gather (tensorfold.cuda.rdma) when every rank opens it, the rest over NCCL."""
 
     def __init__(self, nccl, world: int, rdma_bytes: int = 0):
-        self.nccl, self.world = nccl, world
+        self.nccl, self.world, self.rdma_bytes = nccl, world, rdma_bytes
         self._buf: dict = {}
         if world > 1 and rdma_bytes and os.environ.get("TF_DS_RDMA", "1") != "0":
             from tensorfold.cuda.rdma import Hybrid, RdmaGather
@@ -123,6 +126,22 @@ class Comm:
         out = torch.empty((self.world, *x.shape), dtype=x.dtype, device=x.device)
         self.nccl.all_gather(x.view(-1), out.view(-1))
         return out
+
+    def reduced(self, x: torch.Tensor) -> torch.Tensor:
+        """A prompt chunk's fp32 partials [n, d] for the mHC post kernels: ``gather(x)`` [world, n, d], or with
+        TF_DS_RS on two ranks (rows over the RDMA slot, n even) [1, n, d] bf16 = bf16(p0 + p1), the y those kernels
+        compute from the gather (two-operand fp32 adds have the same bits in either order), from a fp32 reduce-scatter
+        of the rows and a bf16 all-gather: 3/4 of the gather's bytes on the link, 1/4 of its bytes read by the post."""
+
+        n = x.shape[0]
+        if not (RS and self.world == 2 and n % 2 == 0 and x.dtype == F32 and x.numel() * 4 > self.rdma_bytes):
+            return self.gather(x)
+        x = x.contiguous()
+        half = torch.empty((n // 2, *x.shape[1:]), dtype=F32, device=x.device)
+        self.nccl.reduce_scatter(x.view(-1), half.view(-1))
+        y = torch.empty((1, *x.shape), dtype=BF16, device=x.device)
+        self.nccl.all_gather(half.to(BF16).view(-1), y.view(-1))
+        return y
 
     def sum(self, x: torch.Tensor) -> torch.Tensor:
         if self.world == 1:
@@ -1386,7 +1405,7 @@ class Model:
                 pa = self.attention_k(lay, x, sc, start, shared, pos, floor=floor,
                                       kv_done=kv_done and lay.idx == c.n_layers // 2)
             with _T("gather"):
-                g = self.comm.gather(pa)
+                g = self.comm.reduced(pa)
             with _T("hc"):
                 fn, scale, base = lay.hc_ffn
                 if pf2:
@@ -1406,7 +1425,7 @@ class Model:
             with _T("moe"):
                 pm = self.moe(lay, x, img=img)
             with _T("gather"):
-                g = self.comm.gather(pm)
+                g = self.comm.reduced(pm)
             if pf2:
                 pending = g                                      # its post goes into the next layer's attention mixes
             else:

@@ -66,6 +66,8 @@ class NCCL:
         lib.ncclCommInitRank.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, _UniqueId, ctypes.c_int]
         lib.ncclAllGather.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_void_p,
                                       ctypes.c_void_p]
+        lib.ncclReduceScatter.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int,
+                                          ctypes.c_void_p, ctypes.c_void_p]
         self.store = TCPStore(master, port, world, rank == 0, timeout=timedelta(seconds=timeout_s))
         uid = _UniqueId()
         if rank == 0:
@@ -90,6 +92,16 @@ class NCCL:
         stream = torch.cuda.current_stream().cuda_stream
         self._check(self.lib.ncclAllGather(send.data_ptr(), recv.data_ptr(), send.numel(), _DTYPES[send.dtype],
                                            self.comm, stream))
+
+    def reduce_scatter(self, send: torch.Tensor, recv: torch.Tensor) -> None:
+        """recv [n] <- the sum over the ranks of their send's rank-th block (send [world * n]; ncclSum). On two ranks
+        each element is one fp32 add of two operands, so it has the bits of p0 + p1 in either order."""
+
+        if send.numel() != recv.numel() * self.world or send.dtype != recv.dtype:
+            raise ValueError("reduce_scatter: send must hold world x recv of the same dtype")
+        stream = torch.cuda.current_stream().cuda_stream
+        self._check(self.lib.ncclReduceScatter(send.data_ptr(), recv.data_ptr(), recv.numel(), _DTYPES[send.dtype],
+                                               0, self.comm, stream))
 
     def ready(self, label: str, *, every: float = 60.0, timeout: float = 3600.0) -> None:
         """Every rank finishes ``label`` before any goes on; a rank missing after ``timeout`` s is named."""
