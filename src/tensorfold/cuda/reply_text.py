@@ -32,8 +32,8 @@ _DSML_PARAM_RE = re.compile(rf'<{_DSML} parameter name="([^"]+)"(?: string="(tru
                             re.DOTALL)
 
 
-def _dsml_invokes(block: str) -> list[tuple[str, dict[str, Any]]]:
-    """A DSML calls block's invokes as (name, arguments)."""
+def _dsml_invokes(block: str) -> list[tuple[str, dict[str, Any], str]]:
+    """A DSML calls block's invokes as (name, arguments, the invoke's text)."""
 
     out = []
     for inv in _DSML_INVOKE_RE.finditer(block):
@@ -47,7 +47,7 @@ def _dsml_invokes(block: str) -> list[tuple[str, dict[str, Any]]]:
                 except json.JSONDecodeError:
                     pass
             args[key] = value
-        out.append((inv.group(1).strip(), args))
+        out.append((inv.group(1).strip(), args, inv.group(0)))
     return out
 
 
@@ -203,16 +203,26 @@ def parse_tool_calls(text: str, tools: list[dict[str, Any]], *, max_calls: int |
     residue: list[str] = []
     cursor = 0
     # a DSML block is read from its own tags, never as <tool_call> text: a <tool_call> or </tool_call> in the prose or
-    # in an argument cannot move a call's bounds, and a call to a tool the request did not offer stays a call (the
-    # client answers it) instead of call syntax the model never wrote
+    # in an argument cannot move a call's bounds. A call to a tool the request did not offer stays the DSML the model
+    # wrote, as content (TF_DROP_UNOFFERED_TOOL_CALLS=1: removed and logged), as with the other call formats
     for block in _DSML_BLOCK_RE.finditer(text) if _DSML_OPEN in text else ():
         _tagged_calls(text[cursor:block.start()], tools, known, schemas, max_calls, calls, residue)
         cursor = block.end()
-        for name, args in _dsml_invokes(block.group(1)):
-            if not name or max_calls is not None and (len(calls) >= max_calls or name.lower() not in known
-                                                      or not _finite(args)):
+        unoffered = []
+        for name, args, raw in _dsml_invokes(block.group(1)):
+            if not name:
                 continue
-            calls.append(_call(known.get(name.lower(), name), args))
+            if name.lower() not in known:
+                if max_calls is None:
+                    unoffered.append(keep_unoffered_call(raw, name))
+                elif drop_unoffered_calls():
+                    keep_unoffered_call(raw, name)          # single-call mode removes the block anyway: log it
+                continue
+            if max_calls is not None and (len(calls) >= max_calls or not _finite(args)):
+                continue
+            calls.append(_call(known[name.lower()], args))
+        if any(unoffered):
+            residue.append(_DSML_OPEN + "\n" + "\n".join(u for u in unoffered if u) + "\n" + _DSML_CLOSE)
     _tagged_calls(text[cursor:], tools, known, schemas, max_calls, calls, residue)
     return "".join(residue).strip(), calls or None
 

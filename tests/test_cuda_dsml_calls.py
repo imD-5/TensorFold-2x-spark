@@ -1,6 +1,6 @@
 """DeepSeek DSML calls on the CUDA server read from their own tags: call syntax in the prose or in an argument cannot
-move a call's bounds, a call to a tool the request did not offer stays a call, and the call streamer stays out of
-DSML blocks."""
+move a call's bounds, a call to a tool the request did not offer stays the DSML text it was (as other formats do),
+and the call streamer stays out of DSML blocks."""
 
 import json
 
@@ -50,10 +50,10 @@ def test_an_argument_holding_the_tags_is_the_argument():
     assert named(calls) == [("write", {"file_path": "p.mjs", "content": text}), ("read", {"file_path": "i.js"})]
 
 
-def test_a_tool_the_request_did_not_offer_stays_a_call():
+def test_a_tool_the_request_did_not_offer_stays_the_dsml_it_wrote():
     content, calls = parse_tool_calls("Let me check.\n\n" + calls_block(invoke("check_weather")), TOOLS)
-    assert content == "Let me check."
-    assert named(calls) == [("check_weather", {})]
+    assert calls is None
+    assert content.startswith("Let me check.") and 'invoke name="check_weather"' in content
     assert "tool_call" not in content
 
 
