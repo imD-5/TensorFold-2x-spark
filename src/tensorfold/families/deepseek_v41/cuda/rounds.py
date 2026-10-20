@@ -4,8 +4,9 @@ stream's position and in its own stream's cache rows (a pool slot), read from de
 A row's arithmetic is its solo window's: every kernel is row-invariant, the cache kernels take the row's slot base
 (the ring, the compressed rows, the indexer keys, the compressor's raw inputs), and selection is a total order
 (``kernels.topk_indices``), so a row's top-k does not depend on the round's bucket or the rows beside it. Rounds keep
-the decode windows' kernels by staying at 16 rows or fewer (the row thresholds the solo windows sit under). Prompts
-never come here: a stream's prompt fills its slot through the single-stream path on the slot's views (model.py).
+the decode windows' kernels: they hold TF_DS_ROUND_ROWS rows at most (kernels.ROUND_ROWS, TF_DS_DECODE_ROWS = 16 by
+default), the bound RoundRunner.forward sets for its calls (kernels.round_rows). Prompts never come here: a stream's
+prompt fills its slot through the single-stream path on the slot's views (model.py), under TF_DS_DECODE_ROWS.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from .graph import BUCKET_MIN, bucket_for
 from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, attn_in_rot,
                     l2_fork, l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
 
-MAX_ROWS = K.DECODE_ROWS
+MAX_ROWS = K.ROUND_ROWS
 # TF_DS_ENGRAM_SPLIT=1 (default): a round is one graph a stretch of layers, cut before each Engram layer, so a layer's
 # Engram rows are read while the layers before it run (the arithmetic is the one-graph round's)
 ENGRAM_SPLIT = os.environ.get("TF_DS_ENGRAM_SPLIT", "1") == "1"
@@ -657,8 +658,13 @@ class RoundRunner:
         """``windows``: each stream's (slot, extent base, extent size, first position, token ids, host ids so far):
         rows in that order. Returns logits [R, V] and taps [R, 3 d] (the rows in window order; with SHARED_OUT views of
         the runner's pair, valid until its next forward); ``replay=False``
-        only captures a missing graph (warm-up) and returns (None, None)."""
+        only captures a missing graph (warm-up) and returns (None, None). Up to MAX_ROWS rows take the row-invariant
+        kernels here (kernels.round_rows)."""
 
+        with K.round_rows():
+            return self._forward(windows, replay)
+
+    def _forward(self, windows: list[tuple], replay: bool) -> tuple[torch.Tensor, torch.Tensor | None]:
         m = self.m
         ids, pos, slots, base, end = [], [], [], [], []
         hashes = []

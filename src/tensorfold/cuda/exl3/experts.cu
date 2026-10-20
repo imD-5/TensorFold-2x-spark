@@ -7,6 +7,7 @@
 #include <c10/cuda/CUDAGuard.h>
 
 #include "experts_grouped.cuh"
+#include "experts_shared.cuh"
 
 namespace {
 
@@ -154,7 +155,8 @@ __global__ void __launch_bounds__(LIST_THREADS) work_list_kernel(const int* __re
                                                                  const int* __restrict__ uids,
                                                                  const int* __restrict__ ucount, int maxu,
                                                                  int* __restrict__ work0, int rows0, int n0,
-                                                                 int* __restrict__ work1, int rows1, int n1) {
+                                                                 int* __restrict__ work1, int rows1, int n1,
+                                                                 int skip_e) {
     __shared__ int warp_tot[LIST_THREADS / 32];
     const int nu = ucount[0];
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
@@ -164,7 +166,8 @@ __global__ void __launch_bounds__(LIST_THREADS) work_list_kernel(const int* __re
         int base = 0;
         for (int start = 0; start < maxu; start += LIST_THREADS) {
             const int p = start + threadIdx.x;
-            const int g = (p < maxu && p < nu) ? (counts[uids[p]] + rows - 1) / rows : 0;
+            const int e = (p < maxu && p < nu) ? uids[p] : -1;   // (skip_e: the shared expert, run dense)
+            const int g = (e >= 0 && e != skip_e) ? (counts[e] + rows - 1) / rows : 0;
             int inc = g;                              // inclusive scan of the groups in thread (= place) order
 #pragma unroll
             for (int o = 1; o < 32; o <<= 1) {
@@ -780,11 +783,31 @@ void exl3x_group_place_cuda(const at::Tensor& pick, const at::Tensor& counts, at
 }
 
 void exl3x_work_list_cuda(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount,
-                          at::Tensor& work0, int64_t rows0, at::Tensor& work1, int64_t rows1) {
+                          at::Tensor& work0, int64_t rows0, at::Tensor& work1, int64_t rows1, int64_t skip_e) {
     work_list_kernel<<<1, LIST_THREADS, 0, at::cuda::getCurrentCUDAStream()>>>(
         counts.data_ptr<int>(), uids.data_ptr<int>(), ucount.data_ptr<int>(), (int)uids.numel(),
         work0.data_ptr<int>(), (int)rows0, (int)(work0.numel() / 2),
-        work1.numel() ? work1.data_ptr<int>() : nullptr, (int)rows1, (int)(work1.numel() / 2));
+        work1.numel() ? work1.data_ptr<int>() : nullptr, (int)rows1, (int)(work1.numel() / 2), (int)skip_e);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_shared_predecode_cuda(int64_t tptr, int64_t k2, int64_t K, int64_t N, int64_t cb, at::Tensor& out) {
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const uint32_t* T = reinterpret_cast<const uint32_t*>(tptr);
+    uint4* o = reinterpret_cast<uint4*>(out.data_ptr());
+    if (cb == 0) tf_exl3x::shared_predecode_launch<0>(T, (int)k2, (int)K, (int)N, o, stream);
+    else if (cb == 1) tf_exl3x::shared_predecode_launch<1>(T, (int)k2, (int)K, (int)N, o, stream);
+    else if (cb == 2) tf_exl3x::shared_predecode_launch<2>(T, (int)k2, (int)K, (int)N, o, stream);
+    else TORCH_CHECK(false, "codebook must be 0 (3inst), 1 (mcg) or 2 (mul1)");
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void exl3x_shared_mma_cuda(const at::Tensor& X, const at::Tensor& B, at::Tensor& Z, int64_t mat, int64_t K, int64_t N,
+                           int64_t P, int64_t R, int64_t slots, int64_t slot, int64_t SK, int64_t WK, int64_t fold) {
+    tf_exl3x::shared_mma_launch(reinterpret_cast<const half*>(X.data_ptr()),
+                                reinterpret_cast<const uint4*>(B.data_ptr()), Z.data_ptr<float>(), (int)mat, (int)K,
+                                (int)N, (int)P, (int)R, (int)slots, (int)slot, (int)SK, (int)WK, fold != 0,
+                                at::cuda::getCurrentCUDAStream());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

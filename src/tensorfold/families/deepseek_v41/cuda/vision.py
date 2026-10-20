@@ -25,6 +25,14 @@ import torch.nn.functional as F
 TEXT = -1
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 PLACEHOLDER = "<｜deepseek_image｜>"
+PLAIN_PLACEHOLDER = "<|deepseek_image|>"
+
+
+def escape_placeholder(text: str) -> str:
+    """The placeholder inside a message's own text (TF #17) becomes the plain ASCII form, which the tokenizer reads
+    as ordinary text: quoted filenames and quoted turns cannot inject the image token. Idempotent, and a no-op on
+    text that holds no fullwidth placeholder."""
+    return text.replace(PLACEHOLDER, PLAIN_PLACEHOLDER)
 
 
 @dataclass(frozen=True)
@@ -295,13 +303,23 @@ class DsVision:
 
     def split(self, messages: list) -> tuple[list, list[Picture]]:
         """Messages with every image part replaced by the placeholder (content as one string, DeepSeek's join) and
-        the decoded pictures in prompt order. ValueError for anything DeepSeek's encoding refuses."""
+        the decoded pictures in prompt order. When the chat carries an image part, the placeholder inside a message's
+        own text is escaped (TF #17): its string ``content``, its ``reasoning_content`` and the ``text`` of its array
+        parts become the plain ASCII form the tokenizer reads as text; the image part's own rendered placeholder keeps
+        the special form. A chat without an image part passes through byte-identical. ValueError for anything
+        DeepSeek's encoding refuses."""
 
+        images = self.has_images(messages)
         out, pictures = [], []
         for m in messages:
+            if images and isinstance(m, dict):
+                content = m.get("content")
+                if isinstance(content, str) and PLACEHOLDER in content:
+                    m = {**m, "content": escape_placeholder(content)}
+                reasoning = m.get("reasoning_content")
+                if isinstance(reasoning, str) and PLACEHOLDER in reasoning:
+                    m = {**m, "reasoning_content": escape_placeholder(reasoning)}
             content = m.get("content") if isinstance(m, dict) else None
-            if isinstance(content, str) and PLACEHOLDER in content:
-                raise ValueError("message text must not contain the image placeholder token")
             if not isinstance(content, list):
                 out.append(m)
                 continue
@@ -324,9 +342,7 @@ class DsVision:
                     text = part.get("text")
                     if not isinstance(text, str):
                         raise ValueError("a text part needs a text string")
-                    if PLACEHOLDER in text:
-                        raise ValueError("message text must not contain the image placeholder token")
-                    texts.append(text)
+                    texts.append(escape_placeholder(text) if images else text)
                 else:
                     raise ValueError("content parts must be text or image_url")
             out.append({**m, "content": "\n\n".join(texts)})

@@ -415,16 +415,21 @@ class BatchDraftGraph:
         self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 steps]: one host read a round
 
     def capture(self, pool=None):
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            self._body()
-        torch.cuda.current_stream().wait_stream(s)
-        torch.cuda.synchronize()
-        self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
-            self._body()
-        torch.cuda.synchronize()
+        m = self.d.m
+        m.graph_moe = True                               # 13+ streams: 64+ rows, a MoE scratch the graph keeps
+        try:
+            s = torch.cuda.Stream()
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                self._body()
+            torch.cuda.current_stream().wait_stream(s)
+            torch.cuda.synchronize()
+            self.graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.graph, pool=pool):
+                self._body()
+            torch.cuda.synchronize()
+        finally:
+            m.graph_moe = False
 
     def run(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
         if _rounds.ONE_COPY:

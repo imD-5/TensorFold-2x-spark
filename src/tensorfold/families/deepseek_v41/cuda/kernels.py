@@ -7,6 +7,7 @@ Rounding follows DeepSeek's reference (fp32 math, bf16 where its tensors are bf1
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 
@@ -17,8 +18,31 @@ from triton.language.extra.cuda import gdc_launch_dependents, gdc_wait
 
 HC_BLOCKS = 40          # fixed K split of the mHC mixing dots (a function of the shape only)
 # decode / verify windows: at most this many rows take the row-invariant kernels (one row a program, split keys);
-# larger calls (prompt chunks) take the tiled ones. Concurrent rounds stay within it (rounds.MAX_ROWS)
+# larger calls (prompt chunks) take the tiled ones
 DECODE_ROWS = int(os.environ.get("TF_DS_DECODE_ROWS") or 16)
+# TF_DS_ROUND_ROWS (default: TF_DS_DECODE_ROWS): the most rows a concurrent round holds (rounds.MAX_ROWS). Inside a
+# round (``round_rows``: RoundRunner.forward) calls up to ROUND_ROWS rows take the row-invariant kernels; a prompt chunk
+# keeps the DECODE_ROWS bound, so no prompt changes kernels and every row's bits stay its solo window's: a wider round
+# only verifies more drafts when many streams decode
+ROUND_ROWS = max(DECODE_ROWS, int(os.environ.get("TF_DS_ROUND_ROWS") or 0))
+_ROWS = [DECODE_ROWS]           # the bound now: DECODE_ROWS, ROUND_ROWS inside a round
+
+
+def decode_rows() -> int:
+    """The most rows a call takes the row-invariant kernels with now: DECODE_ROWS (ROUND_ROWS inside a round)."""
+    return _ROWS[0]
+
+
+@contextlib.contextmanager
+def round_rows():
+    """A concurrent round's calls (its graphs built, captured or run): up to ROUND_ROWS rows on the row-invariant
+    kernels."""
+    old = _ROWS[0]
+    _ROWS[0] = ROUND_ROWS
+    try:
+        yield
+    finally:
+        _ROWS[0] = old
 
 
 # -- mHC: mixes of the stream (for the next sublayer) + collapse with the carried pre-mix + RMSNorm ---------------
@@ -153,6 +177,127 @@ def hc_post(gathered: torch.Tensor, h: torch.Tensor, post: torch.Tensor, comb: t
                                  num_warps=4, **_pdl())
 
 
+# -- mHC of prompt chunks (switch "hc_pf2"): the mixes' partial dots of RB rows a program, each mixing weight tile loaded
+# once for them, and with the previous sublayer's gathered output its hc_post fused in (written to a second stream
+# buffer): the streams are read once for the post and the dots instead of twice. A program takes RB rows x one K block
+# (512 columns of one stream) x the 24 mixes as three [8, 128] tiles: each row's dots and sum of squares in
+# _hc_partial's arithmetic (_hc_mix_rows': one warp a mix, 4 columns a lane, the 2-warp sum of squares; _hc_post's
+# contraction), so a row's bits are the served ones whatever shares its program. The four programs of a column block
+# (one a stream) are adjacent in launch order, so the old streams and the gathered rows each reads come from L2 after
+# the first. hc_pre2 (switch "hc_pf") is shaped for decode windows: 3 programs a block each redo the post.
+HC_PF_RB_DEFAULT = 8
+HC_PF_RB = int(os.environ.get("TF_DS_HC_PF_RB") or HC_PF_RB_DEFAULT)
+
+
+@triton.jit
+def _hc_mix_pf(X, XO, G, RS, POST, COMB, FN, PART, rows, WIDE: tl.constexpr, D: tl.constexpr, NB: tl.constexpr,
+               SUB: tl.constexpr, MB: tl.constexpr, WORLD: tl.constexpr, POSTED: tl.constexpr, RB: tl.constexpr):
+    NC: tl.constexpr = NB // 4                                  # K blocks a stream
+    KB: tl.constexpr = WIDE // NB                               # a K block's columns (all in one stream)
+    pid = tl.program_id(0)
+    s = pid % 4
+    c = (pid // 4) % NC
+    r0 = (pid // (4 * NC)) * RB
+    b = s * NC + c
+    k = tl.arange(0, SUB)
+    m = tl.arange(0, MB)
+    cs = ()
+    accs = ()
+    sss = ()
+    for i in tl.static_range(RB):
+        r = tl.minimum(r0 + i, rows - 1)                        # (a row past the chunk: computed, never stored)
+        if POSTED:
+            cs = cs + (tl.load(COMB + r * 16 + 0 * 4 + s), tl.load(COMB + r * 16 + 1 * 4 + s),
+                       tl.load(COMB + r * 16 + 2 * 4 + s), tl.load(COMB + r * 16 + 3 * 4 + s),
+                       tl.load(POST + r * 4 + s))
+        accs = accs + (tl.zeros((MB,), dtype=tl.float32), tl.zeros((MB,), dtype=tl.float32),
+                       tl.zeros((MB,), dtype=tl.float32))
+        sss = sss + (tl.zeros((SUB,), dtype=tl.float32),)
+    for t in tl.static_range(KB // SUB):
+        d = c * KB + t * SUB + k                                # the stream's columns
+        wk = b * KB + t * SUB + k                               # the mixing weights' (flattened) columns
+        w0 = tl.load(FN + (0 * MB + m)[:, None] * WIDE + wk[None, :])
+        w1 = tl.load(FN + (1 * MB + m)[:, None] * WIDE + wk[None, :])
+        w2 = tl.load(FN + (2 * MB + m)[:, None] * WIDE + wk[None, :])
+        naccs = ()
+        nsss = ()
+        for i in tl.static_range(RB):
+            r = tl.minimum(r0 + i, rows - 1)
+            if POSTED:
+                ya = tl.load(G + r * D + d)
+                for q in tl.static_range(1, WORLD):
+                    ya = ya + tl.load(G + q * RS + r * D + d)
+                y = ya.to(tl.bfloat16).to(tl.float32)
+                x0 = tl.load(X + r * WIDE + d).to(tl.float32)
+                x1 = tl.load(X + r * WIDE + D + d).to(tl.float32)
+                x2 = tl.load(X + r * WIDE + 2 * D + d).to(tl.float32)
+                x3 = tl.load(X + r * WIDE + 3 * D + d).to(tl.float32)
+                # _hc_post's contraction, spelled out: fma(ps, y, fma(c3, x3, fma(c2, x2, fma(c0, x0, c1 x1))))
+                v = tl.fma(cs[5 * i + 4], y, tl.fma(cs[5 * i + 3], x3, tl.fma(cs[5 * i + 2], x2,
+                                                                               tl.fma(cs[5 * i + 0], x0,
+                                                                                      cs[5 * i + 1] * x1))))
+                xb = v.to(tl.bfloat16)
+                tl.store(XO + r * WIDE + s * D + d, xb, mask=(k < SUB) & (r0 + i < rows))
+                x = xb.to(tl.float32)
+            else:
+                x = tl.load(X + r * WIDE + s * D + d).to(tl.float32)
+            naccs = naccs + (accs[3 * i + 0] + tl.sum(w0 * x[None, :], axis=1),
+                             accs[3 * i + 1] + tl.sum(w1 * x[None, :], axis=1),
+                             accs[3 * i + 2] + tl.sum(w2 * x[None, :], axis=1))
+            nsss = nsss + (tl.fma(x, x, sss[i]),)                 # _hc_partial's fma(x, x, ss)
+        accs = naccs
+        sss = nsss
+    for i in tl.static_range(RB):
+        ok = r0 + i < rows
+        base = PART + ((r0 + i) * NB + b) * 32
+        tl.store(base + 0 * MB + m, accs[3 * i + 0], mask=(m < MB) & ok)
+        tl.store(base + 1 * MB + m, accs[3 * i + 1], mask=(m < MB) & ok)
+        tl.store(base + 2 * MB + m, accs[3 * i + 2], mask=(m < MB) & ok)
+        tl.store(base + 24, tl.sum(sss[i], axis=0), mask=ok)
+
+
+def hc_pf2_ok(d: int) -> bool:
+    """Whether hc_mix_pf takes streams of width d (a K block's columns within one stream, whole 128-column tiles)."""
+
+    kb = 4 * d // HC_BLOCKS
+    return (4 * d) % HC_BLOCKS == 0 and HC_BLOCKS % 4 == 0 and d % kb == 0 and kb % 128 == 0
+
+
+def hc_mix_pf(h: torch.Tensor, fn: torch.Tensor, part: torch.Tensor, gathered: torch.Tensor | None = None,
+              h_out: torch.Tensor | None = None, post: torch.Tensor | None = None,
+              comb: torch.Tensor | None = None) -> torch.Tensor:
+    """A prompt chunk's mHC mixes' partial dots of h into ``part`` (_hc_partial's sums, the same bits), or with
+    ``gathered`` the previous sublayer's hc_post (reading h, post, comb) written into ``h_out`` (not h) and the dots of
+    it. Returns the streams the dots were taken of (h_out, or h)."""
+
+    rows, d = h.shape[0], h.shape[-1]
+    rb = max(1, min(HC_PF_RB, rows))
+    grid = (triton.cdiv(rows, rb) * HC_BLOCKS,)
+    if gathered is None:
+        _hc_mix_pf[grid](h, h, h, 0, part, part, fn, part, rows, WIDE=4 * d, D=d, NB=HC_BLOCKS, SUB=128, MB=8,
+                         WORLD=1, POSTED=False, RB=rb, num_warps=2)
+        return h
+    assert h_out is not None and h_out.data_ptr() != h.data_ptr()
+    _hc_mix_pf[grid](h, h_out, gathered, rows * d, post, comb, fn, part, rows, WIDE=4 * d, D=d, NB=HC_BLOCKS,
+                     SUB=128, MB=8, WORLD=gathered.shape[0], POSTED=True, RB=rb, num_warps=2)
+    return h_out
+
+
+def hc_pre_pf(h: torch.Tensor, fn: torch.Tensor, scale: torch.Tensor, base: torch.Tensor, pre_in: torch.Tensor,
+              norm_w: torch.Tensor, eps: float, hc_eps: float, iters: int, out: torch.Tensor, pre_out: torch.Tensor,
+              post: torch.Tensor, comb: torch.Tensor, part: torch.Tensor, gathered: torch.Tensor | None = None,
+              h_out: torch.Tensor | None = None) -> torch.Tensor:
+    """hc_pre's outputs for a prompt chunk (the same bits): hc_mix_pf, then hc_pre's own finish; with ``gathered`` the
+    previous sublayer's hc_post fused in (into ``h_out``, whose streams the outputs are then of). Returns the streams
+    the mixes were taken of."""
+
+    src = hc_mix_pf(h, fn, part, gathered, h_out, post, comb)
+    rows, d = h.shape[0], h.shape[-1]
+    _hc_finish[(rows,)](src, part, base, scale, pre_in, norm_w, out, pre_out, post, comb, eps, hc_eps, D=d,
+                        NB=HC_BLOCKS, ITERS=iters, BLOCK=1024, num_warps=8)
+    return src
+
+
 # -- the decode round's small kernels, faster and with the same bits (SMALL_SWITCHES) --------------------------------
 # Each switch replaces kernels of the decode round with ones that keep every output's arithmetic: the same per-output
 # reduction trees (each tile keeps the old tile's per-row layout: a row's dot is one warp's, the same elements a lane,
@@ -226,6 +371,13 @@ SMALL_SWITCHES = {
                                                                  # or past a row's visible count skips its dots (all
                                                                  # -inf anyway) and, when only the pruned selection
                                                                  # reads the keys, writes none (PAD tile maximum)
+    "hc_pf2": os.environ.get("TF_DS_HC_PF2", "1") != "0",        # prompt chunks: every sublayer's post fused into
+                                                                 # the next one's mixes through hc_mix_pf (RB rows a
+                                                                 # program share each weight tile; the MoE's post into
+                                                                 # the next layer's attention mixes, unless Engram or
+                                                                 # a tap reads the streams first): the same bits, one
+                                                                 # pass over the streams; GB10, 2048 rows: post +
+                                                                 # mixes 2.72 -> 2.17 ms (plain mixes keep hc_pre)
     "hc_pf": os.environ.get("TF_DS_HC_PF", "0") != "0",          # (default off: slower at 2048 rows, see below)
                                                                  # prompt chunks: the mHC mixes through hc_pre2
                                                                  # (_hc_mix_part: 8 rows a program share each mixing
@@ -848,7 +1000,7 @@ def rowmm2(x: torch.Tensor, w: torch.Tensor, out: torch.Tensor | None = None) ->
 
     rows, k = x.shape
     n = w.shape[0]
-    if rows > ROWMM2_ROWS and ROWMM_RB > 0 and k % 256 == 0 and rows <= DECODE_ROWS:
+    if rows > ROWMM2_ROWS and ROWMM_RB > 0 and k % 256 == 0 and rows <= _ROWS[0]:
         if out is None:
             out = torch.empty((rows, n), dtype=torch.float32, device=x.device)
         bn = 4 if n > 64 else 1
@@ -1434,8 +1586,7 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
                 rot: tuple | None = None, one_split: bool = False) -> torch.Tensor:
     """q [R, H, HD] bf16 -> o [R, H, HD]; window keys from ``wsrc`` (a ring: slot = position % size; else linear from
     position wlo[0]); compressed keys comp[idx[r, j]] (idx -1 = none). ``comp`` is a bf16 [N, HD] tensor or a packed
-    FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16]). ``one_split``: a few rows of a prompt chunk run
-    as one split, so they get the bits the same rows get in a longer chunk."""
+    FP4 pair (codes uint8 [N, HD/2], E4M3 scales uint8 [N, HD/16])."""
 
     rows, h, hd = q.shape
     if out is None:
@@ -1445,8 +1596,9 @@ def sparse_attn(q: torch.Tensor, sink: torch.Tensor, wsrc: torch.Tensor, wlo: to
     packed = has and isinstance(comp, tuple)
     codes, scales = (comp if packed else (comp, None)) if has else (wsrc, None)
     n_idx = idx.shape[1] if has else 0
-    # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough
-    sp = ATTN_SPLITS if rows <= DECODE_ROWS and not one_split else 1
+    # decode / verify windows split the keys (parallelism for a few rows); prompt chunks have rows enough. ``one_split``:
+    # a small prompt chunk run as a large one (TF_DS_REPLAY_FLOOR), the same compiled variant and bits
+    sp = ATTN_SPLITS if rows <= _ROWS[0] and not one_split else 1
     groups = h // hb
     final = sp == 1
     picks = triton.cdiv(n_idx, bn) if has else 0
@@ -1575,7 +1727,7 @@ def _index_score(Q, K, KS, Wt, VIS, OUT, n, KB, CAND, cs, TMAX, nt, IH: tl.const
 @triton.jit
 def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexpr, ID: tl.constexpr,
                       BN: tl.constexpr, RB: tl.constexpr, PACKED: tl.constexpr, KEYS: tl.constexpr = False,
-                      HAS_TMAX: tl.constexpr = False):
+                      HAS_TMAX: tl.constexpr = False, TREE: tl.constexpr = False):
     """Prompt chunks: RB rows a program share each key tile (dequantized once for all of them). KEYS: the scores as
     topk_indices' int64 keys (as _index_score's KEYS)."""
 
@@ -1606,7 +1758,15 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexp
         k_hi = tl.load(K + t[:, None] * ID + HALF + hc[None, :], mask=ok[:, None], other=0.0)
     s = tl.dot(q_lo, tl.trans(k_lo)) + tl.dot(q_hi, tl.trans(k_hi))      # [RB * IH, BN]
     w = tl.load(Wt + qflat, mask=tl.reshape(tl.broadcast_to(rok[:, None], (RB, IH)), (RB * IH,)), other=0.0).to(tl.float32)
-    sc = tl.sum(tl.reshape(tl.maximum(s, 0.0) * w[:, None], (RB, IH, BN)), axis=1)    # [RB, BN]
+    if TREE:
+        # (IH 32) h = 16 h4 + 8 h3 + h_low: the pair over h3, the 8 over h_low, then the halves over h4: the order of
+        # the 8 rows / 8 warps launch's reduce (in-thread pair, lane butterfly, the two warps' partials) at any RB / warps
+        x = tl.reshape(tl.maximum(s, 0.0) * w[:, None], (RB, 2, 2, IH // 4, BN))
+        x = tl.sum(x, axis=2)                                           # [RB, 2, 8, BN]
+        x = tl.sum(x, axis=2)                                           # [RB, 2, BN]
+        sc = tl.sum(x, axis=1)                                          # [RB, BN]
+    else:
+        sc = tl.sum(tl.reshape(tl.maximum(s, 0.0) * w[:, None], (RB, IH, BN)), axis=1)    # [RB, BN]
     vis = tl.load(VIS + rr, mask=rok, other=0)
     sc = tl.where(t[None, :] < vis[:, None], sc, float("-inf"))
     if KEYS:                           # topk_indices' keys: the score's bits in total order above, ~index below
@@ -1620,12 +1780,25 @@ def _index_score_rows(Q, K, KS, Wt, VIS, OUT, n, rows, TMAX, nt, IH: tl.constexp
         tl.store(OUT + rr[:, None] * n + t[None, :], sc, mask=rok[:, None] & ok[None, :])
 
 
+# TF_DS_IDX_TREE / TF_DS_IDX_RB / TF_DS_IDX_WARPS (default 1 / 1 row / 1 warp; the launch was 8 / 8, then 2 / 2): the
+# head-sum tree, rows a program and warps of prompt chunks' indexer scores (_index_score_rows). TREE sums each key's 32
+# head terms in the 8 rows / 8 warps launch's order, written out (the pair h, h + 8 a thread held, then the 8 lanes over
+# h mod 8, then the two warps' halves), so any rows / warps a program give the same scores and keys
+# (tools/dsv41/index_knobs_bench.py --tree: bit for bit at 8K-512K keys for 1-8 rows x 1-8 warps). GB10: 3.75-4.54 ms a
+# launch against 4.68-5.29 at 2 / 2 and 5.55-6.08 at 8 / 8 (which held 255 registers and spilled). Without the tree only
+# settings where a row's 32 heads span 2+ warps keep that order (2 / 2 is the default then). Long prompts: these scores
+# are the part of a chunk that grows with its position (3 index layers x 2048 rows x position / 2 keys x 32 x 128).
+IDX_TREE = (os.environ.get("TF_DS_IDX_TREE") or "1") != "0"
+IDX_RB = int(os.environ.get("TF_DS_IDX_RB") or (1 if IDX_TREE else 2))
+IDX_WARPS = int(os.environ.get("TF_DS_IDX_WARPS") or (1 if IDX_TREE else 2))
+
+
 def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
                 out: torch.Tensor | None = None, base: torch.Tensor | None = None, keys: bool = False,
                 tmax: bool = False, rowwise: bool = False):
     """q [R, IH, ID] bf16, k bf16 [>= n, ID] or a packed FP4 pair (codes [N, ID/2], E8M0 [N, ID/32]),
-    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= DECODE_ROWS) take one row a program
-    (row-invariant); prompt chunks share each key tile among 8 rows (``rowwise``: one row a program for them too).
+    w [R, IH] -> score [R, n] fp32 (-inf at t >= vis[r]). Decode / verify windows (R <= decode_rows()) take one row a program
+    (row-invariant); prompt chunks share each key tile among IDX_RB rows (``rowwise``: one row a program for them too).
     ``keys``: topk_indices' int64 keys of those scores instead (the same kernels, so the same scores; for
     topk_select); with ``tmax`` also each 64-key tile's largest key: returns (keys, [R, ceil(n / 64)] int64)."""
 
@@ -1637,16 +1810,16 @@ def index_score(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int,
     bn = 64
     nt = triton.cdiv(n, bn)
     tm = torch.empty((rows, nt), dtype=torch.int64, device=q.device) if tmax else out
-    if rows <= DECODE_ROWS or rowwise:
+    if rows <= _ROWS[0] or rowwise:
         _index_score[(rows, nt)](q, codes, scales, w, vis, out, n, vis if base is None else base, vis, 0, tm, nt,
                                  IH=ih, ID=idim, BN=bn, PACKED=packed, HAS_BASE=base is not None, num_warps=4,
                                  KEYS=keys, HAS_TMAX=tmax and keys, SKIP_DEAD=SMALL_SWITCHES["tile_skip"], **_pdl())
     else:
-        assert base is None, "concurrent rounds are decode windows (DECODE_ROWS rows at most)"
-        rbs = 8
+        assert base is None, "concurrent rounds are decode windows (decode_rows() rows at most)"
+        rbs = IDX_RB
         _index_score_rows[(triton.cdiv(rows, rbs), nt)](q, codes, scales, w, vis, out, n, rows, tm, nt,
                                                          IH=ih, ID=idim, BN=bn, RB=rbs, PACKED=packed, KEYS=keys,
-                                                         HAS_TMAX=tmax and keys, num_warps=8)
+                                                         HAS_TMAX=tmax and keys, TREE=IDX_TREE, num_warps=IDX_WARPS)
     return (out, tm) if tmax else out
 
 
@@ -1659,7 +1832,7 @@ def index_keys(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: int, b
     past a row's vis write no keys and PAD_KEY as their maximum (switch "tile_skip"; the same selection)."""
 
     rows, ih, idim = q.shape
-    assert rows <= DECODE_ROWS
+    assert rows <= _ROWS[0]
     out = torch.empty((rows, n), dtype=torch.int64, device=q.device)
     packed = isinstance(k, tuple)
     codes, scales = k if packed else (k, k)
@@ -1737,7 +1910,7 @@ def index_keys_cand(q: torch.Tensor, k, w: torch.Tensor, vis: torch.Tensor, n: i
     holds every visible position, so topk_select of these keys == topk_select of the full-width masked keys."""
 
     rows, ih, idim = q.shape
-    assert rows <= DECODE_ROWS and cblk.dtype == torch.int32
+    assert rows <= _ROWS[0] and cblk.dtype == torch.int32
     nout = cblk.shape[1] * cand_block
     out = torch.empty((rows, nout), dtype=torch.int64, device=q.device)
     packed = isinstance(k, tuple)
@@ -2163,7 +2336,7 @@ def rowmm_gate(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     n = w.shape[0]
     bn, cpg, nw = _rp_tile(rows)
     kc = k // 256
-    if (SMALL_SWITCHES["rowmm_parts"] and ROWMM_PARTS_MIN <= rows <= DECODE_ROWS and k % 256 == 0 and kc % cpg == 0
+    if (SMALL_SWITCHES["rowmm_parts"] and ROWMM_PARTS_MIN <= rows <= _ROWS[0] and k % 256 == 0 and kc % cpg == 0
             and n >= 32 and x.dtype == torch.bfloat16 and w.dtype == torch.float16):
         out = torch.empty((rows, kc, n), dtype=torch.float32, device=x.device)
         _rowmm_parts[(triton.cdiv(n, bn), kc // cpg)](x, x.stride(0), w, out, rows, K=k, N=n, BN=bn, BK=256, CPG=cpg,

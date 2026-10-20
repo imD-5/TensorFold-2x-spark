@@ -33,7 +33,12 @@ static void check_io(const at::Tensor& x, const char* name) {
 
 // xh [M, K] fp16 = fp16(((x * suh) @ H) / sqrt(128)); x [M, K] fp16, bf16 or fp32.
 void rot_in(const at::Tensor& x, const at::Tensor& suh, at::Tensor xh) {
-    check_io(x, "x");
+    const auto t = x.scalar_type();             // x: contiguous, or a row-strided view (rows 16-byte aligned)
+    TORCH_CHECK(x.is_cuda() && x.dim() == 2 && (t == at::kHalf || t == at::kBFloat16 || t == at::kFloat),
+                "x: expected a 2-d fp16, bf16 or fp32 CUDA tensor");
+    TORCH_CHECK(x.stride(1) == 1 && x.stride(0) >= x.size(1) && (x.stride(0) * x.element_size()) % 16 == 0 &&
+                    reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0,
+                "x: rows must be unit-stride and 16-byte aligned");
     check(suh, at::kHalf, "suh");
     check(xh, at::kHalf, "xh");
     TORCH_CHECK(x.size(1) % 128 == 0 && suh.numel() == x.size(1) && xh.sizes() == x.sizes(),

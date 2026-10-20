@@ -91,14 +91,16 @@ class Workspace:
 
 def matmul(layer: Exl3Linear, x: torch.Tensor, out: torch.Tensor, ws: Workspace,
            by_shape: bool | None = None) -> torch.Tensor:
-    """out [M, N] (row stride free) = x [M, K] @ W + bias for any M, the prompt path's arithmetic (by_shape: tiles())."""
+    """out [M, N] (row stride free) = x [M, K] (row stride free too) @ W + bias for any M, the prompt path's arithmetic
+    (by_shape: tiles())."""
 
     m, k, n = x.shape[0], layer.k, layer.n
     if x.shape[1] != k or out.shape != (m, n) or out.stride(1) != 1:
         raise ValueError(f"prefill matmul: x {tuple(x.shape)} and out {tuple(out.shape)} do not match K={k}, N={n}")
     ext = _ext()
     xh = ws._grow("xh", m * k, x.device)[:m * k].view(m, k)
-    ext.rot_in(x.contiguous(), layer.suh, xh)
+    rows_ok = x.stride(1) == 1 and (x.stride(0) * x.element_size()) % 16 == 0 and x.data_ptr() % 16 == 0
+    ext.rot_in(x if rows_ok else x.contiguous(), layer.suh, xh)          # a row-strided x is read in place
     wq = ws._grow("w", k * n, x.device)[:k * n].view(k, n)
     ext.unpack(layer.words, wq, *layer.strides, layer.k2, CODEBOOK_IDS[layer.codebook])
     bm, bk, warps, stages, group = tiles(k, n, by_shape)

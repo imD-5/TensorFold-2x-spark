@@ -7,8 +7,9 @@ verify window in one forward a round, each reply exactly its solo run.
 - **Rounds.** Every live stream's pending token and drafts go through one forward (``rounds.RoundRunner``): each row
   at its own position and slot. Every kernel is row-invariant, the cache kernels read each row's own stream and
   selection is a total order, so a row's logits are the solo run's at that position, and each stream samples its own
-  rows by its own rule: its reply is its solo reply, whatever else runs beside it. A round holds 16 rows at most
-  (the decode windows' kernels): each stream's depth comes from ``DEPTH_BY`` by how many streams decode.
+  rows by its own rule: its reply is its solo reply, whatever else runs beside it. A round holds TF_DS_ROUND_ROWS rows
+  at most (16 by default), all on the decode windows' kernels: each stream's depth comes from ``DEPTH_BY`` by how many
+  streams decode, within the round's rows.
 - **Drafts.** Each stream's DSpark drafter runs on its slot's own drafter cache (a captured graph a slot). Drafts
   only propose: they change speed, never a reply.
 - **Ranks.** Rank 0 schedules (``tensorfold.cuda.scheduler``) and sends each step to the followers over a TCP link
@@ -461,7 +462,7 @@ class MultiDecoder:
         self.free = list(range(slots))
         self.max_rows = MAX_ROWS
         if not engine.drafts + 1 <= MAX_ROWS < 64:     # a solo verify window must take the decode kernels, a round too
-            raise ValueError(f"TF_DS_DECODE_ROWS={MAX_ROWS} must hold a verify window ({engine.drafts + 1} rows) "
+            raise ValueError(f"TF_DS_ROUND_ROWS={MAX_ROWS} must hold a verify window ({engine.drafts + 1} rows) "
                              "and stay under the 64-row prompt kernels")
         self.depth_most = engine.drafts
         graphs = engine.runner is not None
@@ -507,7 +508,7 @@ class MultiDecoder:
                     self.spill = None
 
     def warm(self, buckets=(1024, 2048, 4096, 8192)) -> None:
-        """Before serving, on every rank in the same order: round graphs for 1 .. 16 rows at the small context
+        """Before serving, on every rank in the same order: round graphs for 1 .. max_rows rows at the small context
         buckets (synthetic rows on slot 0, which a request rewrites before it reads them) and each slot's drafter
         graph."""
 

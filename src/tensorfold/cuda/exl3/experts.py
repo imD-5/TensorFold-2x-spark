@@ -50,6 +50,32 @@ MMA_KB6 = os.environ.get("TF_EXL3_MMA_KB6", "0") != "0"
 GROUP_LIST = os.environ.get("TF_EXL3_GROUP_LIST", "1") != "0"
 
 
+# TF_EXL3_SHARED_DENSE=1 (default off: the same bits but no faster): a prompt chunk's shared expert (every row a
+# member: the caller passes its slot) as one dense GEMM, its trellis decoded once a call into mma B fragments
+# (shared_mma, 128 rows a program) instead of once per 64-row member block of the grouped launches; the work lists skip
+# its place. The same arithmetic per output (grouped_mma's chains and folded splits for gate / up, grouped_rows' chains
+# for down): bit-equal at 2048 / 1000 / 256 / 64 rows on two layers, but a layer's routed experts at 2048 rows took
+# 24.17 -> 24.02 ms and 23.56 -> 23.76 ms (GB10): the shared expert's groups already overlap the routed ones.
+SHARED_DENSE = os.environ.get("TF_EXL3_SHARED_DENSE", "0") != "0"
+
+
+def _shared_trellis(ex) -> tuple | None:
+    """(gate, up, down) int16 trellises and K2s of the layer's last expert (the shared one), from the tensors prepare()
+    keeps, checked once against the pointer tables (None when they do not match: the grouped launches then run it)."""
+
+    got = getattr(ex, "_tf_shared_tp", 0)
+    if got == 0:
+        E = ex.count
+        got = None
+        if len(ex.keep) >= 3 * E:
+            ts = (ex.keep[E - 1], ex.keep[2 * E - 1], ex.keep[3 * E - 1])
+            want = [int(v) for v in torch.stack([ex.gate_ptr[E - 1], ex.up_ptr[E - 1], ex.down_ptr[E - 1]]).tolist()]
+            if [t.data_ptr() for t in ts] == want:
+                got = tuple((t, k2_of(t)) for t in ts)
+        ex._tf_shared_tp = got
+    return got
+
+
 def _list_len(P: int, maxu: int, rows: int) -> int:
     """A work list's length: at most maxu places hold P member slots, so they have at most (P + maxu (rows - 1)) // rows
     groups of ``rows`` (the shape's alone; ext.work_list fills the tail with pairs no program runs)."""
@@ -122,7 +148,7 @@ def _ext():
 
     here = Path(__file__).parent
     srcs = [str(here / f) for f in ("experts.cpp", "experts.cu", "experts_cb0.cu", "experts_cb1.cu", "experts_cb2.cu")]
-    return load(name="tensorfold_exl3_experts_v18", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
+    return load(name="tensorfold_exl3_experts_v19", sources=srcs, extra_cuda_cflags=["-O3", "-lineinfo"],
                 verbose=False)
 
 
@@ -304,9 +330,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
            out: torch.Tensor | None, R: int, limit: float = math.inf, act_mode: int = ACT_F32,
            group: bool = True, prompt: bool | None = None, add: torch.Tensor | None = None,
            kernel: str | None = None, decode: str | None = None,
-           before_down: torch.cuda.Event | None = None) -> torch.Tensor:
+           before_down: torch.cuda.Event | None = None, shared_slot: int | None = None) -> torch.Tensor:
     """Routed experts of R rows (picks >= E skipped): Y per slot, or ``out`` = the wts-weighted sum when ``wts`` (plus
     ``add`` [R, D] fp32 added last, in the same launch, when given).
+
+    ``shared_slot``: the slot where every row picks the last expert (the shared one); a prompt chunk then runs that
+    expert as one dense GEMM (SHARED_DENSE), the same bits.
 
     Decode windows make no host sync. Prompt chunks (``group`` and R >= EXACT_ROWS) read the busiest expert's row count
     once; with ``prompt`` (default TF_EXL3_PROMPT_TILES) they group in parallel and decode each weight tile once for
@@ -373,6 +402,12 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
     mma = mma_ok and _mma_chains(D // 16, s.cfg_gu[1], s.cfg_gu[2])
     mma_d = mma_ok and _mma_chains(I // 16, s.cfg_d[1], s.cfg_d[2])
     work_gu = work_d = s.no_work
+    dense = (fast and GROUP_LIST and SHARED_DENSE and shared_slot is not None and not (mma2 or mma3)
+             and s.cfg_d[2] == 1 and D % 64 == 0 and I % 64 == 0 and (D // 16) % (sk * w) == 0
+             and ((D // 16) // (sk * w)) % 2 == 0 and (I // 16) % s.cfg_d[1] == 0
+             and ((I // 16) // s.cfg_d[1]) % 2 == 0)        # (shared_mma steps 2 or 4 k tiles: even chains only)
+    trell = _shared_trellis(ex) if dense else None
+    dense = trell is not None
     if fast and GROUP_LIST and not (mma2 or mma3):
         # the work lists of the gate / up and the down launches (64-row blocks for the mma kernel, the rows kernel's
         # member groups): one launch on the device, each list as long as the shape allows (no host read)
@@ -382,7 +417,17 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         work_gu = torch.empty((_list_len(P, maxu, rows_gu), 2), dtype=torch.int32, device=x.device)
         work_d = (work_gu if rows_d == rows_gu else
                   torch.empty((_list_len(P, maxu, rows_d), 2), dtype=torch.int32, device=x.device))
-        ext.work_list(s.counts, ids, s.count, work_gu, rows_gu, s.no_work if work_d is work_gu else work_d, rows_d)
+        ext.work_list(s.counts, ids, s.count, work_gu, rows_gu, s.no_work if work_d is work_gu else work_d, rows_d,
+                      E - 1 if dense else -1)
+    if dense:
+        # the shared expert's three matrices decoded once into mma B fragments (gate, up: D x I; down: I x D)
+        if getattr(s, "shared_b", None) is None or s.shared_b.numel() < 3 * D * I:
+            s.shared_b = torch.empty((3 * D * I,), dtype=torch.float16, device=x.device)
+        (tg, kg), (tu, ku), (td, kd) = trell
+        bg, bu, bd = s.shared_b[:D * I], s.shared_b[D * I:2 * D * I], s.shared_b[2 * D * I:3 * D * I]
+        ext.shared_predecode(tg.data_ptr(), kg, D, I, ex.cb, bg)
+        ext.shared_predecode(tu.data_ptr(), ku, D, I, ex.cb, bu)
+        ext.shared_predecode(td.data_ptr(), kd, I, D, ex.cb, bd)
     if getattr(s, "prompt", False):
         # a prompt scratch's z starts at the folded sums' size; a call that writes split partials (gate / up without
         # the fast path, a down written per split) grows it first (eager prompt chunks only: no graph holds it)
@@ -403,11 +448,17 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         # every split's chains in one program, their sum from 0 as the epilogue would add them
         ext.grouped_mma(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
                         P, sk, slots, ex.cb, w, ex.k2_gu[0], ex.k2_gu[1], 1 | _mma_steps() << 1, work_gu)
+        if dense:
+            ext.shared_mma(s.xg, bg, s.z, 0, D, I, P, R, slots, shared_slot, sk, w, 1)
+            ext.shared_mma(s.xu, bu, s.z, 1, D, I, P, R, slots, shared_slot, sk, w, 1)
     elif fast:
         # one program runs the K splits in order and writes their sum from 0, as the epilogue would add them
         pnt, ppf, pg = PROMPT_TILES["gateup"]
         ext.grouped_rows(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D,
                          I, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_gu[0], ex.k2_gu[1], 1, work_gu)
+        if dense:
+            ext.shared_mma(s.xg, bg, s.z, 0, D, I, P, R, slots, shared_slot, sk, w, 1)
+            ext.shared_mma(s.xu, bu, s.z, 1, D, I, P, R, slots, shared_slot, sk, w, 1)
     else:
         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xg, s.xu, ex.gate_ptr, ex.up_ptr, ex.gate_k2, ex.up_k2, ids, s.count, members, s.z, 2, D, I,
@@ -435,10 +486,14 @@ def routed(x: torch.Tensor, pick: torch.Tensor, wts: torch.Tensor | None, ex: Ex
         ext.grouped_mma(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
                         I, D, P, sk, slots, ex.cb, w, ex.k2_d[0], ex.k2_d[1], int(sk > 1) | _mma_steps() << 1, work_d)
         dsk = 1
+        if dense:
+            ext.shared_mma(s.xd, bd, s.z, 0, I, D, P, R, slots, shared_slot, 1, w, 0)
     elif fast:
         pnt, ppf, pg = PROMPT_TILES["down"]
         ext.grouped_rows(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1,
                          I, D, P, sk, slots, ex.cb, pnt, w, ppf, pg, ex.k2_d[0], ex.k2_d[1], 0, work_d)
+        if dense:
+            ext.shared_mma(s.xd, bd, s.z, 0, I, D, P, R, slots, shared_slot, 1, w, 0)
     else:
         cp = DECODE_STAGES if (mode != "old" and ex.aligned16 and nt == 8 and w == 4) else 0
         ext.grouped(s.xd, s.xd, ex.down_ptr, ex.down_ptr, ex.down_k2, ex.down_k2, ids, s.count, members, s.z, 1, I,

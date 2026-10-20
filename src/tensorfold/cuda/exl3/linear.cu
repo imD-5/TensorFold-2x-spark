@@ -13,13 +13,13 @@ using namespace tf_exl3;
 
 namespace {
 
-__global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype,
+__global__ void __launch_bounds__(128) rot_in_kernel(const void* __restrict__ x, int x_dtype, long long ldx,
                                                      const half* __restrict__ suh, half* __restrict__ xh, int K) {
     const int blk = blockIdx.x * 4 + (threadIdx.x >> 5), row = blockIdx.y, lane = threadIdx.x & 31;
     if (blk * 128 >= K) return;
     const int k = blk * 128 + 4 * lane;
     float v[4], s[4];
-    load4(x, x_dtype, (size_t)row * K + k, v);
+    load4(x, x_dtype, (size_t)row * (size_t)ldx + k, v);      // x's rows ldx apart (a row-strided view too)
     load4(suh, F16, k, s);
     rot128_in(v, s, lane);
     store4(xh, F16, (size_t)row * K + k, v);
@@ -192,7 +192,7 @@ void exl3_rot_in_cuda(const at::Tensor& x, const at::Tensor& suh, at::Tensor& xh
     const int M = (int)x.size(0), K = (int)x.size(1);
     dim3 grid((unsigned)((K / 128 + 3) / 4), (unsigned)M);
     rot_in_kernel<<<grid, 128, 0, at::cuda::getCurrentCUDAStream()>>>(
-        x.data_ptr(), dtype_of(x), reinterpret_cast<const half*>(suh.data_ptr()),
+        x.data_ptr(), dtype_of(x), (long long)x.stride(0), reinterpret_cast<const half*>(suh.data_ptr()),
         reinterpret_cast<half*>(xh.data_ptr()), K);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -27,13 +27,22 @@ from ..ops import (BF16, F32, EngramHasher, HostIds, RopeTables, fp4_qd, fp8_qd,
 RAW = 64                            # per-position compressor inputs kept (a verify window rolls back by length alone)
 RING_EXTRA = 16                     # window ring slots beyond the 128-token window (verify windows never clobber)
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
+# TF_DS_REPLAY_FLOOR=1: a prompt chunk of RING_EXTRA rows or fewer whose window reaches below the bounded replay's
+# floor reads it by the gather path from the floor (one split, the prompt chunks' variant) instead of the ring, where
+# the slot's previous request's keys sit below the floor (prompts of 2048k+112..127 tokens, last chunks of 2-16 rows
+# answered by what ran before). Off (default): the lane's bits. The Zig port's 65f295ec, the same rule.
+REPLAY_FLOOR = os.environ.get("TF_DS_REPLAY_FLOOR", "0") == "1"
+
+
+def ring_mode_for(n: int, start: int, floor: int, window: int) -> bool:
+    """Whether a chunk of ``n`` rows at ``start`` reads its window keys from the ring: RING_EXTRA rows or fewer, unless
+    TF_DS_REPLAY_FLOOR is on and its window reaches below ``floor`` (the bounded replay's floor)."""
+
+    return n <= RING_EXTRA and not (REPLAY_FLOOR and floor > max(0, start - (window - 1)))
+
+
 KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
 TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall times (synchronizing; profiling only)
-# TF_DS_REPLAY_FLOOR=1: a prompt chunk of RING_EXTRA rows or fewer whose window reaches below the bounded replay's cut
-# reads its window keys by the gather path from the cut, as a larger chunk's rows do. Ring mode would read the ring's
-# slots below the cut, which still hold the slot's previous request's keys, so the reply could depend on what ran
-# before it (prompts of 2048k+112 to 2048k+127 tokens, or a short last chunk). The Zig port's switch of the same name.
-REPLAY_FLOOR = os.environ.get("TF_DS_REPLAY_FLOOR", "0") == "1"
 # TF_DS_ENGRAM_PREFETCH=1 (default): a prompt chunk reads its Engram rows ahead on a second reader pool
 ENGRAM_PREFETCH = os.environ.get("TF_DS_ENGRAM_PREFETCH", "1") == "1"
 # TF_DS_ENGRAM_RANDOM=1 (default): the tables' files are read without readahead (a row is 264 bytes at a random offset)
@@ -44,6 +53,11 @@ ENGRAM_RANDOM = os.environ.get("TF_DS_ENGRAM_RANDOM", "1") == "1"
 # idle took ~0.6 ms on GB10, two hand-offs made a 6-row window's read ~2 ms (AIO ~0.4-0.8 ms). The same bytes (checked
 # against preads at start; falls back to the pool when the kernel or the filesystem refuses).
 ENGRAM_AIO = os.environ.get("TF_DS_ENGRAM_AIO", "1") == "1"
+# TF_DS_ENGRAM_DIRECT=1 (default): a prompt chunk's Engram reads (lane 1's read-ahead, rows()' fallback) go through the
+# O_DIRECT descriptors on the reader pool (gather_rows2_direct_at: each row's 4 KB-aligned span into an aligned bounce
+# buffer, the row copied out; the same bytes). GB10, a chunk's 24,576 x 2 rows a layer: 144-210 ms buffered (~250K
+# reads/s at any thread count) against 36-60 ms (~1.35M reads/s at 256 threads); the first chunk waits on its read.
+ENGRAM_DIRECT = os.environ.get("TF_DS_ENGRAM_DIRECT", "1") == "1"
 ENGRAM_AIO_SLOTS = 1024                                    # reads in flight at most (8 KB bounce slots: 8 MB)
 # TF_DS_ENGRAM_TOUCH_ASYNC=1 (default): a round's touch is submitted by engram_io's touch thread (aio_touch), not by the
 # round's thread (whose io_submit of it took ~0.6 ms on one node and held the round); 0: submitted inline as before
@@ -68,13 +82,6 @@ class _T:
             import time
             torch.cuda.synchronize()
             TIMES[self.name] = TIMES.get(self.name, 0.0) + time.perf_counter() - self.t
-
-
-def ring_mode_for(n: int, start: int, floor: int, window: int) -> bool:
-    """Whether a chunk of ``n`` rows at ``start`` reads its window keys from the ring: RING_EXTRA rows or fewer, unless
-    TF_DS_REPLAY_FLOOR is on and its window reaches below ``floor`` (the bounded replay's cut)."""
-
-    return n <= RING_EXTRA and not (REPLAY_FLOOR and floor > max(0, start - (window - 1)))
 
 
 def store_rows(cache, rows: torch.Tensor, x: torch.Tensor, block: int, e4m3: bool) -> None:
@@ -121,8 +128,8 @@ class Comm:
         if self.world == 1:
             return x
         g = self.gather(x)
-        acc = g[0].clone()
-        for r in range(1, self.world):
+        acc = g[0] + g[1]                    # (no clone of g[0]: the same fp32 adds in rank order)
+        for r in range(2, self.world):
             acc += g[r]
         return acc
 
@@ -257,7 +264,7 @@ def mm(layer, x: torch.Tensor, out_dtype=BF16, ws: exl3_prefill.Workspace | None
             return layer.grouped(x, out_dtype=out_dtype)
         return layer(x.contiguous(), out_dtype=out_dtype)
     out = torch.empty((m, layer.n), dtype=out_dtype, device=x.device)
-    return exl3_prefill.matmul(layer, x.contiguous(), out, ws or _WS)
+    return exl3_prefill.matmul(layer, x, out, ws or _WS)                  # (a row-strided x is read in place)
 
 
 _WS = exl3_prefill.Workspace()
@@ -318,7 +325,16 @@ def wo_a_out(lay, o: torch.Tensor) -> torch.Tensor:
 
     n = o.shape[0]
     og = o.view(n, len(lay.wo_a), -1)
-    if not GROUPED or EXACT_MM or n > 128:
+    if n > 128 and not EXACT_MM:
+        # a prompt chunk: each slice read in place and written straight into u's column block (mm's prompt GEMM, the
+        # same bits as a copied slice and a cat)
+        u = torch.empty((n, sum(wo.n for wo in lay.wo_a)), dtype=BF16, device=o.device)
+        c = 0
+        for g, wo in enumerate(lay.wo_a):
+            exl3_prefill.matmul(wo, og[:, g], u[:, c:c + wo.n], _WS)
+            c += wo.n
+        return u
+    if not GROUPED or EXACT_MM:
         return torch.cat([mm(wo, og[:, g].contiguous()) for g, wo in enumerate(lay.wo_a)], -1)
     group = getattr(lay, "_tf_wo_a", None)
     if group is None:
@@ -440,7 +456,7 @@ def _engram_io():
         here = Path(__file__).parent
         from torch.utils import cpp_extension
 
-        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v7", sources=[str(here / "engram_io.cpp")],
+        _engram_io.ext = cpp_extension.load(name="tf_ds_engram_io_v8", sources=[str(here / "engram_io.cpp")],
                                             extra_cflags=["-O3"], verbose=False)
     return _engram_io.ext
 
@@ -511,7 +527,7 @@ class Engram:
                     self.files[name] = (fd, 8 + size + lo, int(np.prod(e["shape"][1:])))
                     paths[fd] = path
         self.io = _engram_io()
-        self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 128)
+        self.threads = int(os.environ.get("TF_DS_ENGRAM_THREADS") or 256)
         self.pinned: dict = {}
         # reads started ahead (prompt chunks, decode rounds): a background thread a lane, pinned slots a layer
         self.ahead: list = []                         # (layer, flat ids, future, slot)
@@ -614,6 +630,11 @@ class Engram:
             dw, _, _ = self.dfiles[f"layers.{layer}.engram.embed.weight"]
             ds, _, _ = self.dfiles[f"layers.{layer}.engram.embed.scale"]
             fut = _AioRead(self.io, self.io.aio_start(dw, bw, rw, ds, bs, rs, it, slot[0][:m], slot[1][:m], 1))
+        elif self.dfiles is not None and ENGRAM_DIRECT:
+            dw, _, _ = self.dfiles[f"layers.{layer}.engram.embed.weight"]
+            ds, _, _ = self.dfiles[f"layers.{layer}.engram.embed.scale"]
+            fut = self.bg[lane].submit(self.io.gather_rows2_direct_at, lane, dw, bw, rw, ds, bs, rs, it, slot[0][:m],
+                                       slot[1][:m], self.threads)
         else:
             fut = self.bg[lane].submit(self.io.gather_rows2_at, lane, fw, bw, rw, fs, bs, rs, it, slot[0][:m],
                                        slot[1][:m], self.threads)
@@ -682,7 +703,12 @@ class Engram:
             self.pinned[layer] = buf
         bw_v, bs_v = buf[0][:m], buf[1][:m]
         it = torch.from_numpy(flat)
-        self.io.gather_rows2(fw, bw, rw, fs, bs, rs, it, bw_v, bs_v, self.threads)
+        if self.dfiles is not None and ENGRAM_DIRECT:
+            dw, _, _ = self.dfiles[f"layers.{layer}.engram.embed.weight"]
+            ds, _, _ = self.dfiles[f"layers.{layer}.engram.embed.scale"]
+            self.io.gather_rows2_direct_at(0, dw, bw, rw, ds, bs, rs, it, bw_v, bs_v, self.threads)
+        else:
+            self.io.gather_rows2(fw, bw, rw, fs, bs, rs, it, bw_v, bs_v, self.threads)
         gw = bw_v.cuda(non_blocking=True)
         gs = bs_v.cuda(non_blocking=True)
         buf[2].record()
@@ -703,6 +729,9 @@ class Model:
         c = self.cfg
         self.Hl = c.n_heads // w.world
         self.scratch: dict = {}
+        # set while a graph body is built (BatchDraftGraph.capture: the eager run before the capture and the capture):
+        # its 64+-row MoE windows take a scratch of their own (_moe_scratch)
+        self.graph_moe = False
         self.rope = RopeTables(c)
         self._zero = torch.zeros((1,), dtype=torch.int64, device="cuda")
         if not KERNELS and KV_QUANT:
@@ -961,14 +990,23 @@ class Model:
         lat, groups = self._compress(lay, x, sc, start)
         shared["kv_layer"] = lay.idx
         rot = self._rot(lay.idx, sc, groups * ratio) if lat is not None else None    # the groups' rotations
+        # a packed FP4 cache's rows in one launch each (switch "comp", as the decode rounds: K.fp4_store is store_rows'
+        # bytes) instead of fp4_pack's dozen torch launches
+        fused = K.on("comp")
         if lat is not None and lay.idx_wk is not None:
             k = rms_norm(mm(lay.idx_wk, lat), lay.idx_k_norm, c.eps)
             rope_(k[..., -rd:], rot)
-            store_rows(sc.index_k[lay.idx], groups, k, 32, False)
+            if fused and isinstance(sc.index_k[lay.idx], tuple):
+                K.fp4_store(k, sc.index_k[lay.idx], groups, 32, False)
+            else:
+                store_rows(sc.index_k[lay.idx], groups, k, 32, False)
         if lat is not None:
             lat = lat.clone()
             rope_(lat[..., -rd:], rot)
-            store_rows(sc.comp[lay.idx], groups, lat, 16, True)
+            if fused and isinstance(sc.comp[lay.idx], tuple):
+                K.fp4_store(lat, sc.comp[lay.idx], groups, 16, True)
+            else:
+                store_rows(sc.comp[lay.idx], groups, lat, 16, True)
 
     def attention_k(self, lay, x: torch.Tensor, sc: SeqCache, start: int, shared: dict, pos: torch.Tensor,
                     floor: int = 0, kv_done: bool = False):
@@ -987,6 +1025,7 @@ class Model:
         ring = sc.ring[lay.idx]
         R = sc.ring_size
         ring_mode = ring_mode_for(n, start, floor, c.window)
+        one_split = not ring_mode and n <= K.decode_rows()
         if ring_mode:
             kv = K.kv_norm_rope(y, lay.kv_norm, cos, sin, pos, ring, pos % R, c.eps, KV_QUANT, rd)
             wsrc, wlo = ring, self._zero
@@ -1013,8 +1052,9 @@ class Model:
                     iq = mm(lay.idx_wq_b, qr).view(n, c.idx_heads, c.idx_dim)
                     K.rope_heads(iq, cos, sin, pos, rd)
                     if KV_QUANT:
-                        iq = fp4_qd(iq, 32, e4m3_scale=False)
-                    wl = ((K.rowmm2 if K.on("rowmm") else K.rowmm)(x, lay.idx_proj_h) if n <= K.DECODE_ROWS
+                        # (switch "idx", as the decode rounds) one launch, fp4_qd's bytes
+                        iq = K.fp4_qd_p2(iq) if K.on("idx") else fp4_qd(iq, 32, e4m3_scale=False)
+                    wl = ((K.rowmm2 if K.on("rowmm") else K.rowmm)(x, lay.idx_proj_h) if n <= K.decode_rows()
                           else x.float() @ lay.idx_proj.t())
                     wts = (wl.to(BF16) * (c.idx_dim ** -0.5 * c.idx_heads ** -0.5))
                     kk = min(c.idx_topk, n_comp_end)
@@ -1051,8 +1091,6 @@ class Model:
                 shared["topk"] = cidx
             cidx = shared["topk"]
             comp = sc.comp[src]
-        # a chunk the floor sends to the gather path runs as one split, as a longer chunk's rows do (its bits)
-        one_split = not ring_mode and n <= K.DECODE_ROWS
         o = K.sparse_attn(q, lay.sink, wsrc, wlo, ring_mode, comp, cidx, pos, hd ** -0.5, c.window,
                           one_split=one_split)
         K.rope_heads(o, cos, sin, pos, rd, inverse=True)
@@ -1091,7 +1129,7 @@ class Model:
             # decode / verify windows: the row-invariant matmul; prompt chunks: one cuBLAS GEMM
             pick = torch.empty((n, slots), dtype=torch.int32, device=x.device)
             wts = torch.empty((n, slots), dtype=F32, device=x.device)
-            logits = ((K.rowmm_gate if K.on("rowmm") else K.rowmm)(x, lay.gate_w) if n <= K.DECODE_ROWS
+            logits = ((K.rowmm_gate if K.on("rowmm") else K.rowmm)(x, lay.gate_w) if n <= K.decode_rows()
                       else (x.float() @ lay.gate_w.float().t()))
             K.route(logits, lay.gate_b, topk, c.route_scale, shared_id, pick, wts)
             if img is not None:
@@ -1114,12 +1152,27 @@ class Model:
         s = self._moe_scratch(lay, n, slots)
         if EXACT_MM:
             return self._moe_exact(lay, x, pick, wts)
+        # the routing put the shared expert (the experts' last) in every row's last slot, unless it runs on the side
         out = exl3_experts.routed(x.contiguous(), pick.contiguous(), wts, lay.experts, s, None, n,
-                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, before_down=side_done)
+                                  limit=c.swiglu_limit, act_mode=exl3_experts.ACT_F32, before_down=side_done,
+                                  shared_slot=slots - 1 if shared_id == lay.experts.count - 1 else None)
         return out                                                        # fp32 partial [n, d]
 
     def _moe_scratch(self, lay, n: int, slots: int) -> "exl3_experts.Scratch":
         prompt = n >= 64
+        if prompt and self.graph_moe:
+            # a graph's window of 64+ rows (the batched drafter at 13+ streams, 5 rows a stream) and the eager run
+            # before its capture take a prompt scratch of their own, one a 128-row bucket, made once and never
+            # replaced: the shared prompt scratch is replaced whenever a wider window comes (the next stream count's
+            # drafter, a prompt chunk), which freed memory the earlier graphs kept writing (16 slots: an illegal memory
+            # access on rank 0)
+            rows = -(-n // 128) * 128
+            gkey = ("moe-graph", slots, lay.experts.count, rows)
+            s = self.scratch.get(gkey)
+            if s is None:
+                s = exl3_experts.Scratch(lay.experts, rows=rows, slots=slots, prompt=True)
+                self.scratch[gkey] = s
+            return s
         skey = ("moe", slots, lay.experts.count, prompt)
         s = self.scratch.get(skey)
         if s is None or s.rows < n:
@@ -1239,6 +1292,22 @@ class Model:
         g = self.comm.gather(local)                                       # [world, n, V / world]
         return g.permute(1, 0, 2).reshape(local.shape[0], -1)
 
+    def _hc_pf2(self, h, h_alt, gathered, fn, scale, base, pre_in, norm, x, pre_out, post, comb, part):
+        """(switch "hc_pf2") a prompt chunk's mixes: hc_pre's outputs through kernels.hc_pre_pf, with the post of
+        ``gathered`` (when given) fused in, written to the second stream buffer, which becomes the streams.
+        Returns (streams, second buffer, None)."""
+
+        c = self.cfg
+        if gathered is None:
+            # no post to fuse: hc_pre as served (hc_mix_pf's plain dots measured 1.57 -> 1.69 ms at 2048 rows)
+            K.hc_pre(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb, part)
+            return h, h_alt, None
+        if h_alt is None or h_alt.shape != h.shape:
+            h_alt = torch.empty_like(h)
+        src = K.hc_pre_pf(h, fn, scale, base, pre_in, norm, c.eps, c.hc_eps, c.hc_iters, x, pre_out, post, comb,
+                          part, gathered=gathered, h_out=h_alt)
+        return src, h, None
+
     def _forward_k(self, sc, ids, start, all_logits, taps, h, pre, hashes, shared, replay=None, img=None):
         """``replay`` (decoder SWA bounded replay, CED's prefill): the decoder layers run only for rows at positions
         >= replay, their window truncated there; the first decoder layer's kv source still covers every row."""
@@ -1254,13 +1323,22 @@ class Model:
         post = torch.empty((n, c.hc), dtype=F32, device=dev)
         comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
         floor, kv_done = 0, False
-        h_alt = None                                             # (switch "hc_pf") the streams' second buffer
+        h_alt = None                                             # (switches "hc_pf", "hc_pf2") the streams' second buffer
+        # (switch "hc_pf2") the MoE output gathered at the end of a layer, its post (with the layer's post / comb, which
+        # nothing rewrites before) fused into the next layer's attention mixes, or applied first where Engram or a tap
+        # reads the streams, and after the last layer
+        pf2 = K.on("hc_pf2") and K.hc_pf2_ok(c.dim)
+        pending = None
         self.taps_start = start
         for lay in w.layers:
             if replay is not None and lay.idx == c.n_layers // 2:
                 fn, scale, base = lay.hc_attn
-                K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post, comb,
-                         part)
+                if pf2:
+                    h, h_alt, pending = self._hc_pf2(h, h_alt, pending, fn, scale, base, pre, lay.attn_norm, x, pre_a,
+                                                     post, comb, part)
+                else:
+                    K.hc_pre(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post,
+                             comb, part)
                 self.kv_source_update(lay, x, sc, start, shared)
                 first = max(start, replay) - start
                 if first >= n:
@@ -1281,6 +1359,11 @@ class Model:
                     comb = torch.empty((n, c.hc, c.hc), dtype=F32, device=dev)
                     self.taps_start = start
                 floor, kv_done = replay, True
+            if pending is not None and ((hashes is not None and lay.engram_wkv is not None)
+                                        or (taps is not None and lay.idx in c.dspark_taps)):
+                with _T("hc"):
+                    K.hc_post(pending, h, post, comb, h)         # Engram / the tap reads the posted streams
+                pending = None
             if hashes is not None and lay.engram_wkv is not None:
                 with _T("engram"):
                     rows = hashes[:, c.engram_layers.index(lay.idx)]
@@ -1290,7 +1373,10 @@ class Model:
             fn, scale, base = lay.hc_attn
             hc_pf = K.on("hc_pf") and c.dim % 1024 == 0
             with _T("hc"):
-                if hc_pf:
+                if pf2:
+                    h, h_alt, pending = self._hc_pf2(h, h_alt, pending, fn, scale, base, pre, lay.attn_norm, x, pre_a,
+                                                     post, comb, part)
+                elif hc_pf:
                     K.hc_pre2(h, fn, scale, base, pre, lay.attn_norm, c.eps, c.hc_eps, c.hc_iters, x, pre_a, post,
                               comb, part)
                 else:
@@ -1303,7 +1389,10 @@ class Model:
                 g = self.comm.gather(pa)
             with _T("hc"):
                 fn, scale, base = lay.hc_ffn
-                if hc_pf:
+                if pf2:
+                    h, h_alt, _ = self._hc_pf2(h, h_alt, g, fn, scale, base, pre_a, lay.ffn_norm, x, pre_f, post,
+                                               comb, part)
+                elif hc_pf:
                     # (switch "hc_pf") the attention post fused into the FFN mixes: the posted streams go to the
                     # other buffer (programs still read h), which becomes h
                     if h_alt is None or h_alt.shape != h.shape:
@@ -1318,9 +1407,15 @@ class Model:
                 pm = self.moe(lay, x, img=img)
             with _T("gather"):
                 g = self.comm.gather(pm)
-            with _T("hc"):
-                K.hc_post(g, h, post, comb, h)
+            if pf2:
+                pending = g                                      # its post goes into the next layer's attention mixes
+            else:
+                with _T("hc"):
+                    K.hc_post(g, h, post, comb, h)
             pre, pre_f = pre_f, pre
+        if pending is not None:
+            with _T("hc"):
+                K.hc_post(pending, h, post, comb, h)
         sc.length = start + n
         if not all_logits:
             h, pre = h[-1:], pre[-1:]

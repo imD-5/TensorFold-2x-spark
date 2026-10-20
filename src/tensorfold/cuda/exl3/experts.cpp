@@ -33,7 +33,10 @@ void exl3x_group_count_cuda(const at::Tensor&, at::Tensor&, int64_t, int64_t, in
 void exl3x_group_place_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&, int64_t,
                             int64_t, int64_t);
 void exl3x_work_list_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, at::Tensor&,
-                          int64_t);
+                          int64_t, int64_t);
+void exl3x_shared_predecode_cuda(int64_t, int64_t, int64_t, int64_t, int64_t, at::Tensor&);
+void exl3x_shared_mma_cuda(const at::Tensor&, const at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t,
+                           int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
 void exl3x_rot_in_cuda(const at::Tensor&, int64_t, const at::Tensor&, const at::Tensor&, const at::Tensor&,
                        at::Tensor&, at::Tensor&, int64_t, int64_t, int64_t, int64_t);
 void exl3x_gateup_epilogue_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -250,7 +253,7 @@ void group_place(const at::Tensor& pick, const at::Tensor& counts, at::Tensor ui
 }
 
 void work_list(const at::Tensor& counts, const at::Tensor& uids, const at::Tensor& ucount, at::Tensor work0,
-               int64_t rows0, at::Tensor work1, int64_t rows1) {
+               int64_t rows0, at::Tensor work1, int64_t rows1, int64_t skip_e) {
     check(counts, at::kInt, "counts");
     check(uids, at::kInt, "uids");
     check(ucount, at::kInt, "ucount");
@@ -260,7 +263,30 @@ void work_list(const at::Tensor& counts, const at::Tensor& uids, const at::Tenso
     TORCH_CHECK(work0.numel() % 2 == 0 && work1.numel() % 2 == 0 && rows0 > 0 && rows1 > 0,
                 "work lists hold (place, group) pairs; groups hold rows");
     c10::cuda::CUDAGuard guard(counts.device());
-    exl3x_work_list_cuda(counts, uids, ucount, work0, rows0, work1, rows1);
+    exl3x_work_list_cuda(counts, uids, ucount, work0, rows0, work1, rows1, skip_e);
+}
+
+// a matrix's trellis (K x N, tiles of 16 x 16 at K2 half-bits a value) decoded into mma B fragments: uint4 out
+// [(K / 16) * (N / 16) * 32] (the shared expert's matrices, decoded once a prompt chunk)
+void shared_predecode(int64_t tptr, int64_t k2, int64_t K, int64_t N, int64_t cb, at::Tensor out) {
+    TORCH_CHECK(out.is_cuda() && out.is_contiguous() && out.nbytes() >= (size_t)K * N * 2, "out: K x N halves at least");
+    TORCH_CHECK(K % 16 == 0 && N % 16 == 0 && tptr != 0, "K, N multiples of 16 and a trellis");
+    c10::cuda::CUDAGuard guard(out.device());
+    exl3x_shared_predecode_cuda(tptr, k2, K, N, cb, out);
+}
+
+// Z rows r * slots + slot (r < R) of a projection of X's rows r * slots + slot, B the predecoded fragments: the
+// grouped kernels' arithmetic (SK splits x WK chains; fold: splits summed from 0 into Z [mats, P, N], else SK 1)
+void shared_mma(const at::Tensor& X, const at::Tensor& B, at::Tensor Z, int64_t mat, int64_t K, int64_t N, int64_t P,
+                int64_t R, int64_t slots, int64_t slot, int64_t SK, int64_t WK, int64_t fold) {
+    check(X, at::kHalf, "X");
+    check(Z, at::kFloat, "Z");
+    TORCH_CHECK(B.is_cuda() && B.is_contiguous() && B.nbytes() >= (size_t)K * N * 2, "B: K x N halves at least");
+    TORCH_CHECK(X.numel() >= P * K && Z.numel() >= (mat + 1) * P * N && R * slots <= P && slot < slots,
+                "X, Z or the rows do not fit");
+    TORCH_CHECK(fold || SK == 1, "an unfolded projection takes one split");
+    c10::cuda::CUDAGuard guard(X.device());
+    exl3x_shared_mma_cuda(X, B, Z, mat, K, N, P, R, slots, slot, SK, WK, fold);
 }
 
 void rot_in(const at::Tensor& x, int64_t x_stride, const at::Tensor& pick, const at::Tensor& suh0,
@@ -440,6 +466,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("group_count", &group_count);
     m.def("group_place", &group_place);
     m.def("work_list", &work_list);
+    m.def("shared_predecode", &shared_predecode);
+    m.def("shared_mma", &shared_mma);
     m.def("rot_in", &rot_in);
     m.def("gateup_epilogue", &gateup_epilogue);
     m.def("down_epilogue", &down_epilogue);

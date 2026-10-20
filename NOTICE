@@ -10,7 +10,8 @@ THIRD_PARTY_NOTICES.md.
 ----------------------------------------------------------------------------------------------------------------------
 Changes in this fork (Apache License 2.0, section 4(b))
 
-This is a fork of TensorFold 0.6.6 (upstream commit cb2ebf0; first forked from 0.6.3, 9356df5) by BertholomusAI (Albert Lee,
+This is a fork of TensorFold 0.6.6 (upstream commit cb2ebf0; first forked from 0.6.3, 9356df5; for v0.6 rebased onto
+upstream's python-0.6 branch, ed78d6f) by BertholomusAI (Albert Lee,
 https://github.com/bertholomus), Copyright 2026. It adds the deepseek_v41 model family for DeepSeek-V4.1-Flash, tensor-parallel over two NVIDIA GB10
 nodes. TensorFold's text above, LICENSE, LICENSES/ and the upstream sections of THIRD_PARTY_NOTICES.md are unchanged.
 
@@ -42,11 +43,24 @@ Modified upstream files:
   src/tensorfold/cuda/server.py                a family's own image prompts continue through its vision object; an opt-in reasoning
                                                loop guard (TF_LOOP_GUARD, the request's "loop_guard")
   src/tensorfold/engine/call_gate.py           ThinkLoop: the loop guard's token 8-gram novelty check
+  src/tensorfold/engine/exact_sampling.py      TF_SEED=random: a request with no explicit seed draws a fresh one (the
+                                               default keys the seed to the prompt)
   src/tensorfold/cuda/comm.py                  NCCL abort and asynchronous-error hooks (a concurrent lane's watchdog)
   src/tensorfold/serve_options.py              --vision for families with their own image path (CUDA_VISION)
   src/tensorfold/cuda/reply_text.py            DSML tool-call parsing for DeepSeek-V4.1
   src/tensorfold/server/request_options.py     reasoning_effort "off" heard as "none"
   src/tensorfold/server/authentication.py      the no-key startup line names the CUDA server's TF_API_KEY gate
+  RUNBOOK.md                                   keeping a nearly-full unified GPU's server out of swap (its kernel pages
+                                               the host out while idle; the first request then stalls on page faults)
   .gitignore                                   ignores macOS ._* files
+  Carried by the v0.6 rebase — upstream python-0.6's own changes the branch now includes (the fork changes none of
+  them): src/tensorfold/cli.py, src/tensorfold/cli_args.py, src/tensorfold/cuda/build.py,
+  src/tensorfold/cuda/kernels/qmm_prefill8.cu, src/tensorfold/families/glm5_next/__init__.py,
+  src/tensorfold/families/glm5_next/cuda/engine.py, src/tensorfold/families/glm5_next/cuda/split.py,
+  src/tensorfold/families/glm5_next/cuda/weights.py, src/tensorfold/families/qwen4_exp/cuda/decode.py,
+  src/tensorfold/families/qwen4_exp/cuda/engine.py, src/tensorfold/families/qwen4_exp/cuda/image_rows.py,
+  src/tensorfold/families/qwen4_exp/cuda/multi.py, src/tensorfold/families/qwen4_exp/cuda/multi_fill.py,
+  src/tensorfold/families/qwen4_exp/cuda/multi_plan.py, src/tensorfold/families/qwen4_exp/cuda/multi_solo.py,
+  src/tensorfold/families/qwen4_exp/cuda/multi_tp.py, tests/test_cuda_cli.py
 
 The "git log" of this branch and tools/dsv41/ATTRIBUTION.md describe the changes and their sources.

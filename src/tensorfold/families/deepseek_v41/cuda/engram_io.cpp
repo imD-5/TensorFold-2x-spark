@@ -113,6 +113,31 @@ Pool& pool(int threads, int which = 0) {
     return *p[which];
 }
 
+// A row through an O_DIRECT descriptor: the 4 KB-aligned span holding it (one or two blocks) into this thread's aligned
+// bounce buffer, then the row copied out (the same bytes as read_row's; the page cache is skipped: a prompt chunk's rows
+// are ~50K random reads in ~100 GB tables a layer, never reread soon)
+bool read_row_direct(int fd, uint8_t* dst, int64_t bytes, int64_t off) {
+    constexpr int64_t BLK = 4096;
+    thread_local uint8_t* buf = nullptr;
+    if (!buf && posix_memalign(reinterpret_cast<void**>(&buf), BLK, 3 * BLK) != 0) {
+        buf = nullptr;
+        return false;
+    }
+    const int64_t a = off & ~(BLK - 1), skew = off - a;
+    const int64_t span = ((skew + bytes + BLK - 1) / BLK) * BLK;
+    if (span > 3 * BLK) return false;
+    int64_t got = 0;
+    while (got < span) {
+        const ssize_t r = pread(fd, buf + got, span - got, a + got);
+        if (r < 0) return false;
+        if (r == 0) break;                            // the file ends inside the span
+        got += r;
+    }
+    if (got < skew + bytes) return false;
+    std::memcpy(dst, buf + skew, bytes);
+    return true;
+}
+
 bool read_row(int fd, uint8_t* dst, int64_t bytes, int64_t off) {
     int64_t got = 0;
     while (got < bytes) {
@@ -127,7 +152,8 @@ bool read_row(int fd, uint8_t* dst, int64_t bytes, int64_t off) {
 
 // A layer's rows: idx [n] row ids; weight rows (fd_w, base_w, row_w bytes) into out_w, scale rows into out_s.
 static void gather_rows2_on(int which, int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s,
-                            int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+                            int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads,
+                            bool direct = false) {
     TORCH_CHECK(idx.dtype() == at::kLong && idx.is_contiguous() && !idx.is_cuda(), "idx: contiguous int64 CPU");
     TORCH_CHECK(out_w.dtype() == at::kByte && out_w.is_contiguous() && !out_w.is_cuda(), "out_w: contiguous uint8 CPU");
     TORCH_CHECK(out_s.dtype() == at::kByte && out_s.is_contiguous() && !out_s.is_cuda(), "out_s: contiguous uint8 CPU");
@@ -139,8 +165,9 @@ static void gather_rows2_on(int which, int64_t fd_w, int64_t base_w, int64_t row
     std::atomic<int> failed(0);
     std::function<void(int64_t)> job = [&](int64_t j) {
         const int64_t i = j >> 1;
-        bool ok = (j & 1) ? read_row((int)fd_s, ds + i * row_s, row_s, base_s + ix[i] * row_s)
-                          : read_row((int)fd_w, dw + i * row_w, row_w, base_w + ix[i] * row_w);
+        auto rd = direct ? read_row_direct : read_row;
+        bool ok = (j & 1) ? rd((int)fd_s, ds + i * row_s, row_s, base_s + ix[i] * row_s)
+                          : rd((int)fd_w, dw + i * row_w, row_w, base_w + ix[i] * row_w);
         if (!ok) failed = 1;
     };
     pool((int)threads, which).run(2 * n, job);
@@ -163,6 +190,13 @@ void gather_rows2_at(int64_t which, int64_t fd_w, int64_t base_w, int64_t row_w,
                      int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
     TORCH_CHECK(which >= 0 && which <= 2, "pool 0, 1 or 2");
     gather_rows2_on((int)which, fd_w, base_w, row_w, fd_s, base_s, row_s, idx, out_w, out_s, threads);
+}
+
+// gather_rows2_at through O_DIRECT descriptors (fd_w, fd_s opened with O_DIRECT; the same bytes)
+void gather_rows2_direct_at(int64_t which, int64_t fd_w, int64_t base_w, int64_t row_w, int64_t fd_s, int64_t base_s,
+                            int64_t row_s, const at::Tensor& idx, at::Tensor out_w, at::Tensor out_s, int64_t threads) {
+    TORCH_CHECK(which >= 0 && which <= 2, "pool 0, 1 or 2");
+    gather_rows2_on((int)which, fd_w, base_w, row_w, fd_s, base_s, row_s, idx, out_w, out_s, threads, true);
 }
 
 // The single-table call (kept for tools): rows of one table.
@@ -446,5 +480,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("gather_rows2_bg", &gather_rows2_bg, "gather_rows2 on the background pool",
           py::call_guard<py::gil_scoped_release>());
     m.def("gather_rows2_at", &gather_rows2_at, "gather_rows2 on reader pool 0, 1 or 2",
+          py::call_guard<py::gil_scoped_release>());
+    m.def("gather_rows2_direct_at", &gather_rows2_direct_at, "gather_rows2_at through O_DIRECT descriptors",
           py::call_guard<py::gil_scoped_release>());
 }

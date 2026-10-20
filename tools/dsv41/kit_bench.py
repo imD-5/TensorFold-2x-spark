@@ -16,7 +16,8 @@ a bare key) and never printed.
   python3 kit_bench.py ... oracle     --out oracle.jsonl
 
 Decode tok/s = (completion tokens - 1) / (last chunk time - first chunk time), first token excluded.
-Prefill tok/s = prompt tokens / time to first token, with a fresh random prefix so no prefix cache hits.
+Prefill tok/s = prompt tokens / time to first token, with a fresh random prefix so no prefix cache hits
+(--fixed-words: the same words every rep behind the fresh prefix, so reps after the first read warm Engram rows).
 The oracle records, for a fixed prompt set, the greedy continuation (64 tokens, top-20 logprobs per
 step) and the teacher-forced top-20 logprobs at every prompt+continuation position.
 """
@@ -282,9 +283,11 @@ def cmd_sustained(c: Client, a) -> list:
     return rows
 
 
-def filler_ids(c: Client, length: int, seed: int) -> list[int]:
+def filler_ids(c: Client, length: int, seed: int, words_seed: int | None = None) -> list[int]:
     rng = random.Random(seed)
     salt = " ".join(f"{rng.randrange(10**9)}" for _ in range(8))
+    if words_seed is not None:                 # the same words every rep (warm Engram rows), a fresh salt (no prefix hits)
+        rng = random.Random(words_seed)
     words = [rng.choice(WORDS) for _ in range(int(length * 0.9) + 64)]
     text = f"Session {salt}. Read the following notes carefully.\n" + " ".join(words)
     ids = c.text_ids(text)
@@ -298,7 +301,8 @@ def cmd_prefill(c: Client, a) -> list:
     rows = []
     for length in [int(x) for x in a.lengths.split(",")]:
         for rep in range(a.reps):
-            ids = filler_ids(c, length, seed=int(time.time() * 1000) ^ (length << 4) ^ rep)
+            ids = filler_ids(c, length, seed=int(time.time() * 1000) ^ (length << 4) ^ rep,
+                             words_seed=length if a.fixed_words else None)
             r = c.stream({"prompt": ids, "max_tokens": 1, "temperature": 0}, "/v1/completions")
             row = {"length": length, "rep": rep, "prompt_tokens": r["prompt_tokens"], "ttft_s": r["ttft_s"],
                    "prefill_tps": r["prompt_tokens"] / r["ttft_s"]}
@@ -365,6 +369,8 @@ def main() -> None:
     s = sub.add_parser("sustained"); s.add_argument("--streams", default="4"); s.add_argument("--tokens", type=int, default=256)
     s.add_argument("--set", choices=sorted(PROMPT_SETS), default="b"); s.add_argument("--seconds", type=float, default=90)
     s = sub.add_parser("prefill"); s.add_argument("--lengths", default="8192,32768,131072"); s.add_argument("--reps", type=int, default=1)
+    s.add_argument("--fixed-words", action="store_true",
+                   help="the same words every rep of a length behind a fresh salt: later reps read warm Engram rows")
     s = sub.add_parser("depth"); s.add_argument("--lengths", default="131072"); s.add_argument("--tokens", type=int, default=256)
     s = sub.add_parser("oracle"); s.add_argument("--gen-tokens", type=int, default=64); s.add_argument("--topk", type=int, default=20)
     for s in sub.choices.values():

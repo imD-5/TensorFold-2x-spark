@@ -73,7 +73,7 @@ def main() -> int:
                 ref = X._work_list(s, ids, grp, total)
                 got = torch.empty((X._list_len(R * (cfg.topk + 1), ids.shape[0], grp), 2), dtype=torch.int32,
                                   device="cuda")
-                X._ext().work_list(s.counts, ids, s.count, got, grp, s.no_work, grp)
+                X._ext().work_list(s.counts, ids, s.count, got, grp, s.no_work, grp, -1)
                 tail = got[total:]
                 res["checks"][f"R{R} {'with' if shared else 'without'} shared, {grp}-row groups: device list == "
                               f"torch list ({total} of {got.shape[0]})"] = bool(
