@@ -169,9 +169,19 @@ class OpenBlocks(Flag):
         self.assertEqual(content, "Checking.")
 
     def test_a_tool_call_tag_that_never_closes_opens_a_block_that_holds_the_rest(self):
-        text = "The <tool_call> tag starts a call.\n" + calls(invoke("read", param("path", "a")))
+        text = "The <tool_call>\nstarts a call.\n" + calls(invoke("read", param("path", "a")))
         self.assertEqual(parse_tool_calls(text, TOOLS), (text, None))
         self.assertEqual(hide_tool_calls(text, finished=True), "The ")
+
+    def test_prose_naming_the_tag_keeps_the_dsml_calls_after_it(self):
+        for prose in ("The <tool_call> tag starts a call.", "I sent that call as `<tool_call>` text.",
+                      'A "<tool_call>", then.'):
+            block = calls(invoke("read", param("path", "a")), invoke("write", param("q", "</tool_call>")))
+            text = prose + "\n\n" + block
+            content, found = parse_tool_calls(text, TOOLS)
+            self.assertEqual((content, names(found), arguments(found)),
+                             (prose, ["read", "write"], [{"path": "a"}, {"q": "</tool_call>"}]), prose)
+            self.assertEqual(hide_tool_calls(text, finished=True).strip(), prose, prose)
 
     def test_an_unfinished_xml_call_is_not_followed_by_a_dsml_call(self):
         text = "<tool_call><function=write></function>\n" + calls(invoke("read", param("path", "a")))
@@ -571,7 +581,7 @@ class Suppressed(Flag):
         self.assertNotIn("tool_calls_suppressed_total", metrics.render(SimpleNamespace()))
 
     def test_a_lone_tool_call_tag_before_a_dsml_call_is_logged_and_counted(self):
-        text = "Use <tool_call> tags.\n" + calls(invoke("read", param("path", "SECRET")))
+        text = "Use <tool_call>\ntags.\n" + calls(invoke("read", param("path", "SECRET")))
         (content, found), log = self.parse(text)
         self.assertEqual((content, found), (text, None))
         self.assertEqual(log.count("\n"), 1)
@@ -597,7 +607,7 @@ class Suppressed(Flag):
         self.assertEqual(suppressed_counts(), {"ill_formed_dsml_block": 1})
 
     def test_one_line_and_one_count_for_each_reason_in_a_reply(self):
-        text = calls("junk\n") + calls("more junk\n") + "<tool_call> " + calls(invoke("read"))
+        text = calls("junk\n") + calls("more junk\n") + "<tool_call>\n" + calls(invoke("read"))
         _, log = self.parse(text)
         self.assertEqual(log.count("\n"), 1)
         self.assertIn("ill_formed_dsml_block at character 0", log)
@@ -607,7 +617,7 @@ class Suppressed(Flag):
         self.assertEqual(suppressed_counts()["ill_formed_dsml_block"], 2)
 
     def test_the_metrics_text_shows_the_counter_by_reason(self):
-        self.parse("Use <tool_call> tags.\n" + calls(invoke("read")))
+        self.parse("Use <tool_call>\ntags.\n" + calls(invoke("read")))
         self.parse("Go.\n" + calls("junk\n"))
         self.parse("Go.\n" + calls("junk\n"))
         body = metrics.render(SimpleNamespace())

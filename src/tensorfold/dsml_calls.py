@@ -93,6 +93,14 @@ def dsml_block_end(text: str, start: int) -> int:
     return closed.end() if closed else -1
 
 
+def _named_in_prose(text: str, start: int, end: int) -> bool:
+    """An opening tag written inline in prose (in backticks or quotes, or before a space or punctuation), not a call."""
+
+    before = text[start - 1:start]
+    after = text[end:end + 1]
+    return bool(before) and before in "`'\"" or bool(after) and after in " `'\".,;:!?)"
+
+
 def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], int]:
     """(the closed blocks at the top level, in order; where the first open block begins, or -1).
 
@@ -113,6 +121,12 @@ def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], 
             return blocks, -1
         if tag is not None and (dsml < 0 or tag.start() < dsml):
             closer = _close_of(text, tag.end(), tag_tags)
+            if (dsml >= 0 and (closer is None or closer.start() > dsml)
+                    and _named_in_prose(text, tag.start(), tag.end()) and dsml_block_end(text, dsml) >= 0):
+                # prose naming the tag ("the `<tool_call>` tag"), not a call: it does not hold the complete DSML
+                # calls block after it, nor reach into that block's arguments for a closing tag
+                pos = tag.end()
+                continue
             if closer is None:
                 return blocks, tag.start()
             blocks.append(Block("tag", tag.start(), closer.end(), text[tag.end():closer.start()]))
