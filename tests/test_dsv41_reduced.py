@@ -6,8 +6,8 @@ from __future__ import annotations
 import threading
 
 import pytest
-import torch
 
+torch = pytest.importorskip("torch")
 pytest.importorskip("triton")
 
 from tensorfold.families.deepseek_v41.cuda import model as M  # noqa: E402
