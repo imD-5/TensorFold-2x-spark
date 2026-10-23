@@ -331,8 +331,9 @@ def test_a_follower_without_a_live_stream_takes_part_in_the_round_check(multi, m
 
 @pytest.fixture
 def depths(multi, monkeypatch):
-    """Rank 0's draft depths by live streams (the default table), up to five drafts."""
+    """Rank 0's draft depths by live streams (the "conf" policy's default table), up to five drafts."""
 
+    monkeypatch.setattr(multi, "DEPTH_POLICY", "conf")
     monkeypatch.setattr(multi, "DEPTH_BY", [5, 5, 3, 3])
 
 

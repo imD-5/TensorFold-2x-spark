@@ -94,6 +94,7 @@ struct Nic {
     ibv_mr* mr = nullptr;                 // the send ring's (the whole block's when the rings are cudaHostAlloc memory)
     ibv_mr* mr_recv = nullptr;            // the receive ring's (== mr in that case)
     ibv_gid gid{};
+    int gid_index = 0;                    // this port's GID table entry (RoCE v2, IPv4), chosen by rdma.py
     ibv_mtu mtu = IBV_MTU_4096;           // the port's active MTU (RoCE: the netdev MTU less headers, rounded down)
     std::vector<ibv_qp*> qps;             // per peer
     std::vector<uint32_t> psns;
@@ -106,7 +107,7 @@ struct Peer {
 };
 
 struct Gather {
-    int rank = 0, world = 1, slots = 4, port = 1, gid_index = 5, cpu = -1;
+    int rank = 0, world = 1, slots = 4, port = 1, cpu = -1;
     size_t max_bytes = 0;
     char* host = nullptr;                 // the metadata's block (host_reg 0: rings + metadata in one cudaHostAlloc)
     size_t host_bytes = 0;
@@ -410,7 +411,7 @@ void proxy_loop(Gather* gp) {
     }
 }
 
-Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
+Nic open_nic(const std::string& name, Gather& g, int world, int rank, int gid_index) {
     int count = 0;
     ibv_device** list = ibv_get_device_list(&count);
     TORCH_CHECK(list && count > 0, "rdma gather: no RDMA devices");
@@ -437,7 +438,9 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
         TORCH_CHECK(nic.mr_recv, "rdma gather: ibv_reg_mr of the ", g.recv_bytes, "-byte receive ring on ", name,
                     " failed");
     }
-    TORCH_CHECK(ibv_query_gid(nic.ctx, g.port, g.gid_index, &nic.gid) == 0, "rdma gather: ibv_query_gid failed");
+    nic.gid_index = gid_index;
+    TORCH_CHECK(gid_index >= 0 && ibv_query_gid(nic.ctx, g.port, gid_index, &nic.gid) == 0,
+                "rdma gather: ibv_query_gid failed for GID index ", gid_index, " of ", name, " port ", g.port);
     // The QPs take the port's active MTU, not a fixed 4096: at netdev MTU 1500 RoCE runs at 1024, and a QP set to 4096
     // sends frames the link drops (every write then fails with "transport retry counter exceeded").
     ibv_port_attr port{};
@@ -479,16 +482,16 @@ Nic open_nic(const std::string& name, Gather& g, int world, int rank) {
 }
 
 int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, const std::vector<std::string>& devices,
-               int64_t gid_index, int64_t cpu, int64_t idle_us, int64_t nap_us) {
+               const std::vector<int64_t>& gid_indices, int64_t cpu, int64_t idle_us, int64_t nap_us) {
     TORCH_CHECK(world >= 2 && rank >= 0 && rank < world, "rdma gather: rank ", rank, " of ", world);
     TORCH_CHECK(max_bytes > 0 && max_bytes % 64 == 0, "rdma gather: max_bytes must be a positive multiple of 64");
     TORCH_CHECK(!devices.empty(), "rdma gather: name at least one RDMA device");
+    TORCH_CHECK(gid_indices.size() == devices.size(), "rdma gather: one GID index a device");
     auto g = std::make_unique<Gather>();
     g->rank = (int)rank;
     g->world = (int)world;
     g->slots = (int)slots;
     g->max_bytes = (size_t)max_bytes;
-    g->gid_index = (int)gid_index;
     g->cpu = (int)cpu;
     g->idle_us = std::max<int64_t>(0, idle_us);
     g->nap_us = std::max<int64_t>(1, nap_us);
@@ -543,7 +546,8 @@ int64_t create(int64_t rank, int64_t world, int64_t max_bytes, int64_t slots, co
     C10_CUDA_CHECK(cudaMemset(g->staged, 0, 8));
     C10_CUDA_CHECK(cudaMalloc(reinterpret_cast<void**>(&g->probe), 8 * 8));
     C10_CUDA_CHECK(cudaMemset(g->probe, 0, 8 * 8));
-    for (const auto& name : devices) g->nics.push_back(open_nic(name, *g, (int)world, (int)rank));
+    for (size_t i = 0; i < devices.size(); ++i)
+        g->nics.push_back(open_nic(devices[i], *g, (int)world, (int)rank, (int)gid_indices[i]));
     g->peers.assign(world, Peer{});
     gathers.push_back(std::move(g));
     return (int64_t)gathers.size() - 1;
@@ -598,7 +602,7 @@ void link_peers(int64_t h, const std::vector<py::tuple>& remote) {
             rtr.min_rnr_timer = 12;
             rtr.ah_attr.is_global = 1;
             std::memcpy(rtr.ah_attr.grh.dgid.raw, peer.gid[d].data(), 16);
-            rtr.ah_attr.grh.sgid_index = g.gid_index;
+            rtr.ah_attr.grh.sgid_index = g.nics[d].gid_index;
             rtr.ah_attr.grh.hop_limit = 64;
             rtr.ah_attr.port_num = g.port;
             TORCH_CHECK(ibv_modify_qp(g.nics[d].qps[p], &rtr,

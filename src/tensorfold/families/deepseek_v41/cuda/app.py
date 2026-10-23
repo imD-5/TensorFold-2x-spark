@@ -17,8 +17,16 @@ from tensorfold.server.errors import RequestError
 EFFORT_VALUES = {"minimal": 25, "low": 50, "medium": 62, "high": 75, "xhigh": 88, "max": 100}
 
 
+# The grounding tokens: DeepSeek's encoding keeps them as tokens in an assistant's content and reasoning (a model wrote
+# them there). Every other special-token spelling in message text is plain text.
+GROUNDING = ("<｜ref｜>", "<｜/ref｜>", "<｜box｜>", "<｜/box｜>",
+             "<｜point｜>", "<｜/point｜>", "<｜polygon｜>", "<｜/polygon｜>")
+
+
 class DsApp(App):
     reads_ignore_eos = True
+    plain_message_text = True           # DeepSeek's encoding: a special-token spelling in message text is plain text
+    plain_assistant_keep = GROUNDING
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -56,7 +64,10 @@ class DsApp(App):
         if kwargs is not None and not isinstance(kwargs, dict):
             raise RequestError("chat_template_kwargs must be a JSON object or null")
         kwargs = dict(kwargs or {})
-        kwargs.setdefault("response_format", rf)        # a client's own template input stays
+        spec = rf.get("json_schema") if rf.get("type") == "json_schema" else None
+        # json_schema: DeepSeek's API layer (deepseek-ai/deepseek-recipe) writes the schema, not the OpenAI wrapper
+        shown = spec["schema"] if isinstance(spec, dict) and isinstance(spec.get("schema"), dict) else rf
+        kwargs.setdefault("response_format", shown)     # a client's own template input stays
         return {**body, "chat_template_kwargs": kwargs}
 
     def run(self, body: dict[str, Any], chat: bool, emit: Callable[[dict[str, Any]], bool], *,
@@ -77,7 +88,10 @@ class DsApp(App):
             text_messages, pictures = vision.split(messages)
         except (ValueError, OSError) as exc:
             raise RequestError(f"image input: {exc}") from exc
-        prepared = super()._prepare({**body, "messages": text_messages}, chat)
+        from .vision import PLACEHOLDER
+
+        # split refused every placeholder that the client wrote, so each one left in content is the server's own
+        prepared = super()._prepare({**body, "messages": text_messages}, chat, plain_keep=(PLACEHOLDER,))
         try:
             vp = vision.expand(prepared.prompt, pictures)
         except ValueError as exc:

@@ -16,6 +16,7 @@ from tensorfold.engine import grammar
 from tensorfold.server.cancellation import RequestCancelled
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
+from tensorfold.server.plain_text import PlainText
 from tensorfold.server.probabilities import TokenBytes, probability_options
 from tensorfold.server.prompt_pieces import PromptPieces
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
@@ -29,8 +30,8 @@ from tensorfold.server.tools import active_tool_specs, tool_choice_requires_call
 
 from tensorfold.cuda import health
 from tensorfold.cuda.chat_template import ChatTemplate
-from tensorfold.cuda.reply_text import (StopStrings, StreamDecoder, answer_without_tools, before_dsml,
-                                        drop_unoffered_calls, hide_tool_calls, parse_tool_calls)
+from tensorfold.cuda.reply_text import (StopStrings, StreamDecoder, answer_without_tools, drop_unoffered_calls,
+                                        hide_tool_calls, parse_tool_calls)
 from tensorfold.cuda.turns import Turns, Yield
 from tensorfold.server.text import is_title_request, reasoning_count, split_thinking
 from tensorfold.vision.images import DEFAULT_LIMITS, ImageLimits
@@ -75,6 +76,8 @@ class App:
     """Serve one engine with sampling and reply-length defaults for requests that omit them."""
 
     reads_ignore_eos = False            # True where the engine reads ``ignore_eos`` itself; a ``stop_eos`` engine is given it
+    plain_message_text = False          # True: a special-token spelling in request text stays text (plain_text.py)
+    plain_assistant_keep: tuple[str, ...] = ()      # spellings an assistant's content and reasoning may keep
 
     def __init__(self, engine, model_dir: Path, served: str, *, default_thinking: bool = False,
                  sampling: dict[str, Any] | None = None, max_tokens: int = 4096,
@@ -104,6 +107,18 @@ class App:
         if self.context_window < 0:
             raise ValueError("context_window must be 0 or a positive token count")
         self.turns = Turns()                # one request at a time where the engine decodes one
+
+    def _plain_text(self) -> PlainText | None:
+        """The request-text shield, made once; None where the family keeps the old tokenization."""
+
+        if not self.plain_message_text or not PlainText.supports(self.tok):
+            return None
+        with _MADE:
+            made = self.__dict__.get("_plain_text_made")
+            if made is None:
+                made = self.__dict__["_plain_text_made"] = PlainText(
+                    self.tok, assistant_keep=self.plain_assistant_keep)
+            return made
 
     @property
     def model_ids(self) -> list[str]:
@@ -184,13 +199,22 @@ class App:
         if not hasattr(self.engine, "score_labels"):
             raise RequestError("this model's CUDA engine does not score decision labels")
 
+        plain = self._plain_text()
+        latest: list[Any] = [None]               # the shield of the question rendered last: its text is encoded next
+
         def render(content: str) -> str:
+            messages = [{"role": "user", "content": content}]
+            shield = plain.shield(self.template.prepared(messages)) if plain else None
+            latest[0] = shield
             try:
-                return self.template.render([{"role": "user", "content": content}], tools=None, enable_thinking=False)
+                return self.template.render(shield.messages if shield else messages, tools=None, enable_thinking=False)
             except TemplateError as exc:
-                raise DecisionError(f"the chat template failed: {exc}") from exc
+                message = shield.spelled(str(exc)) if shield else exc
+                raise DecisionError(f"the chat template failed: {message}") from exc
 
         def encode(text: str) -> list[int]:
+            if plain and latest[0] is not None:
+                return [int(token) for token in plain.encode(text, latest[0])]
             return [int(token) for token in self._encode(text, False)]
 
         try:
@@ -227,7 +251,9 @@ class App:
                     raise RequestError(f"{name} must be an integer token count") from exc
         return max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or self.max_tokens))
 
-    def _prepare(self, body: dict[str, Any], chat: bool) -> PreparedRequest:
+    def _prepare(self, body: dict[str, Any], chat: bool, plain_keep: tuple[str, ...] = ()) -> PreparedRequest:
+        """``plain_keep``: spellings that the server itself wrote into this request's message content."""
+
         from jinja2.exceptions import TemplateError
 
         validate_modalities(body)
@@ -284,9 +310,21 @@ class App:
                 return PreparedRequest(rendered.tokens, max_tokens, tools, thinking,
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
-            text = render(body["messages"])
-            pieces = self._prompt_pieces()
-            prompt = self._encode(text, False) if pieces is None else pieces.ids(text)
+            plain = self._plain_text()
+            # the shield sees the messages as the template gets them: a JSON escape or a split text part hides nothing
+            shield = plain.shield(self.template.prepared(body["messages"]), tools, kwargs,
+                                  content_keep=plain_keep) if plain else None
+            if shield is not None and (shield.table or plain.normalizes):    # a spelling in the request's text: plain text, not a token
+                try:
+                    text = self.template.render(shield.messages, tools=shield.tools, enable_thinking=thinking,
+                                                extra=shield.extra)
+                except TemplateError as exc:
+                    raise RequestError(f"the chat template rejected the request: {shield.spelled(str(exc))}") from exc
+                prompt = plain.encode(text, shield)
+            else:
+                text = render(body["messages"])
+                pieces = self._prompt_pieces()
+                prompt = self._encode(text, False) if pieces is None else pieces.ids(text)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
@@ -444,9 +482,11 @@ class App:
                 reasoning, answer = "", raw
             answer_raw[0] = answer
             if tools:
-                answer = (policy.content(answer, finished=finished) if policy.single
-                          # with the flag the final content drops an unoffered call in any case: hide it so
-                          else hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls()))
+                # with the flag the final content drops an unoffered call in any case: hide it so
+                answer = hide_tool_calls(answer, finished=finished, any_case=drop_unoffered_calls(),
+                                         keep_ill_formed=True)
+                if policy.single:             # one-call mode also hides the namespaced tool_call blocks
+                    answer = policy.content(answer, finished=finished)
             else:                                 # TF_DROP_UNOFFERED_TOOL_CALLS=1: every call is unoffered
                 answer = answer_without_tools(answer, finished=finished)
             return reasoning, answer
@@ -484,8 +524,7 @@ class App:
                 if delta and not emit(delta):
                     stopped["client"] = True
                 if calls_stream is not None and not stopped["client"]:
-                    # never the reasoning, nor a DSML block (a <tool_call> there is an argument's text)
-                    for call_delta in calls_stream.feed(before_dsml(answer_raw[0])):
+                    for call_delta in calls_stream.feed(answer_raw[0]):   # never the reasoning
                         if not emit(call_delta):
                             stopped["client"] = True
                             break
@@ -598,13 +637,14 @@ class App:
         logprobs = (self._probability_decoder.format(probabilities.emitted(out), ends)
                     if probabilities is not None else None)
         # the calls already sent as deltas; the handler sends the rest (a call the streamer could not follow)
-        streamed = calls_stream.index + 1 if calls_stream is not None and calls_stream.streamed else 0
+        streamed = calls_stream.completed if calls_stream is not None and calls_stream.streamed else 0
+        skipped = calls_stream.abandoned if calls_stream is not None and calls_stream.streamed else 0
         return {"final": final, "calls": calls, "finish": finish, "content": content, "reasoning": reasoning,
                 "stop_sequence": matched_stop(raw_text, stops.strings),
                 **({"logprobs": logprobs} if logprobs is not None else {}),
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
-                "stats": stats, "calls_streamed": streamed}
+                "stats": stats, "calls_streamed": streamed, "calls_offset": skipped}
 
     def _prompt_pieces(self) -> PromptPieces | None:
         """The chat prompts' encoded pieces, made once; None for a tokenizer they cannot follow."""

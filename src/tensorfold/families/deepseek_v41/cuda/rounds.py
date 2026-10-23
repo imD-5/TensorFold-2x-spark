@@ -19,7 +19,8 @@ import torch.nn.functional as F
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
 from . import model as _model
-from .graph import BUCKET_MIN, bucket_for
+from .graph_keys import (CAPTURE_MODE, ROUND_ROWS, ROUND_ROWS_LONG, bucket_for, padded_rows, round_keys, row_sizes,
+                         sizes_for)
 from .model import (KV_QUANT, RAW, Model, PoolCache, SeqCache, _candidates, apply_candidates, attn_in, attn_in_rot,
                     l2_fork, l2_join, mm, moe_side, q_proj, store_rows, wo_a_out, wo_a_rot, wo_ab)
 
@@ -560,7 +561,7 @@ class RoundDecoder:
         graphs = []
         for k in range(len(self.stretches)):                  # in order, one pool: a stretch's state feeds the next
             g = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(g, pool=pool):
+            with torch.cuda.graph(g, pool=pool, capture_error_mode=CAPTURE_MODE):
                 self._stretch(k)
             graphs.append(g)
         torch.cuda.synchronize()
@@ -621,7 +622,10 @@ class RoundRunner:
         self.m, self.pool = model, pool
         self.graphs: dict = {} if graphs else None
         self.graph_pool = graph_pool
-        self.captures = 0
+        self.captures = 0          # graphs captured after the warm-up: each one stalls its round
+        self.warmed = False
+        self.sizes = row_sizes(MAX_ROWS, ROUND_ROWS)                 # the row sizes of the graphs (graph_keys)
+        self.sizes_long = row_sizes(MAX_ROWS, ROUND_ROWS_LONG)
         self.out = None
         if SHARED_OUT:                                  # outside every capture: each graph writes these same rows
             c, w = model.cfg, model.w
@@ -631,6 +635,12 @@ class RoundRunner:
 
     def bucket(self, deepest: int) -> int:
         return bucket_for(deepest, self.pool.cap)
+
+    def keys(self, limit: int) -> list[tuple[int, int]]:
+        """Every (rows, bucket) a round can use when a stream reaches ``limit`` tokens at most (the extent pool total:
+        the pool cap is above it), in warm-up order (``graph_keys.round_keys``)."""
+
+        return round_keys(min(limit, self.pool.cap), self.pool.cap, self.sizes, self.sizes_long)
 
     def engram_touch(self, tails: list[list[int]]) -> None:
         """``tails``: each stream's host ids ending with its pending token, the n-gram's tokens before it included (or
@@ -679,11 +689,18 @@ class RoundRunner:
                 hashes.append(m.engram.hashes(host, p0, n))
         R = len(ids)
         b = self.bucket(max(p + 1 for p in pos))
+        Rg = R
+        if self.graphs is not None:                        # also a capture-only call: it makes the key a round uses
+            Rg = padded_rows(R, sizes_for(b, self.sizes, self.sizes_long))
+            for col in (ids, pos, slots, base, end):       # the extra rows copy the last row (graph_keys.ROUND_ROWS)
+                col += col[-1:] * (Rg - R)
         e_rows = e_start = None
         if m.engram is not None and replay:
             import numpy as np
 
             hs = np.concatenate(hashes, 0)
+            if Rg > R:
+                hs = np.concatenate([hs, np.repeat(hs[-1:], Rg - R, 0)], 0)
             lo, hi = m.engram.cols
             idx = {i: hs[:, m.cfg.engram_layers.index(i), lo:hi] for i in m.cfg.engram_layers if i < len(m.w.layers)}
             if ENGRAM_SPLIT:
@@ -697,18 +714,20 @@ class RoundRunner:
                 e_rows = {i: (lambda i=i, ix=ix: m.engram.rows(i, ix)) for i, ix in idx.items()}
             else:
                 e_rows = {i: m.engram.rows(i, ix) for i, ix in idx.items()}
-        key = (R, b)
+        key = (Rg, b)
         g = self.graphs.get(key) if self.graphs is not None else None
         if g is None:
-            g = RoundDecoder(m, self.pool, R, b, True, out=self.out)
+            g = RoundDecoder(m, self.pool, Rg, b, True, out=self.out)
             g.set(ids, pos, slots, base, end)
             if self.graphs is not None:
                 if self.graph_pool is None:
                     self.graph_pool = torch.cuda.graph_pool_handle()
+                if self.warmed:
+                    self.captures += 1
+                    print(f"[tensorfold] WARNING: round graph {key} captured while serving", flush=True)
                 g.capture(self.graph_pool)
                 self.graphs[key] = g
-                self.captures += 1
         if not replay:
             return None, None
         out = g.run(ids, pos, slots, base, end, e_rows, e_start)
-        return out, g.taps
+        return out[:R], (None if g.taps is None else g.taps[:R])

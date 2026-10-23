@@ -12,6 +12,7 @@ import threading
 import time
 from typing import Any
 
+from tensorfold.dsml_calls import suppressed_counts
 from tensorfold.server.memory_budget import process_footprint
 
 PREFIX = "tensorfold:"
@@ -167,6 +168,13 @@ def render(app: Any) -> str:
         _family(lines, "requests_total", "counter", "HTTP replies by API key label and status.",
                 [f'{PREFIX}requests_total{{key="{key}",status="{status}"}} {count}'
                  for (key, status), count in sorted(requests.items())])
+    suppressed = suppressed_counts()
+    if suppressed:       # only once a reply has had one: the Mac server does not count them, so no fake zero
+        _family(lines, "tool_calls_suppressed_total", "counter",
+                "Replies where a block that does not count (an open block, a lone tag or a block that is not well "
+                "formed) kept a later tool call as text, by reason.",
+                [f'{PREFIX}tool_calls_suppressed_total{{reason="{reason}"}} {count}'
+                 for reason, count in sorted(suppressed.items())])
     _family(lines, "requests_running", "gauge", "Requests in prefill or decode.",
             [f"{PREFIX}requests_running {running}"])
     _family(lines, "requests_waiting", "gauge", "Requests queued or held until a lane is free.",

@@ -41,11 +41,16 @@ class ChatTemplate:
             lambda messages: self.template.render(**self.specials, messages=messages, add_generation_prompt=False))
         self.merge_leading = True                     # leading system messages as one (a family can turn it off)
 
+    def prepared(self, messages: list[dict[str, Any]], allow_images: bool = False) -> list[dict[str, Any]]:
+        """The messages as the template gets them: instructions merged, text parts joined, tool arguments parsed."""
+
+        return _normalize_tool_call_arguments(normalize_messages(messages, late_system=self.late_system,
+                                                                 allow_images=allow_images,
+                                                                 merge_leading=self.merge_leading))
+
     def render(self, messages: list[dict[str, Any]], *, tools: list[dict[str, Any]] | None,
                enable_thinking: bool, extra: dict[str, Any] | None = None, allow_images: bool = False) -> str:
-        messages = _normalize_tool_call_arguments(normalize_messages(messages, late_system=self.late_system,
-                                                                     allow_images=allow_images,
-                                                                     merge_leading=self.merge_leading))
+        messages = self.prepared(messages, allow_images)
         kwargs = dict(self.specials, messages=messages, tools=tools or None, add_generation_prompt=True,
                       enable_thinking=enable_thinking)
         kwargs.update(extra or {})

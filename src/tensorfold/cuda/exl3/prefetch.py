@@ -18,8 +18,8 @@ import torch
 
 CHUNK = 8 << 10                   # bytes a bulk prefetch
 BLOCKS = 4                        # unpaced: blocks of 128 threads issuing every chunk at once
-# ns a prefetch waits before issuing, so a gather's staging kernel launched right after the fork runs undisturbed
-DELAY_NS = int(os.environ.get("TF_EXL3_L2_DELAY_NS") or 3000)
+# ns a prefetch waits before issuing (0: at once)
+DELAY_NS = int(os.environ.get("TF_EXL3_L2_DELAY_NS") or 0)
 # > 0 (default 230; 200 before the decode scratch left L2 unwritten: TF_EXL3_L2_DISCARD): one block issues a wave of
 # 128 chunks (1 MiB) every 128 * CHUNK / RATE_GBPS ns, a little under what DRAM serves (~245 GB/s), so DRAM's queue
 # holds about a wave, the bytes arrive about in the order their readers take them, and the kernels running beside keep

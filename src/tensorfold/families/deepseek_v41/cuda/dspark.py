@@ -8,7 +8,9 @@ as one window and keeps the matching prefix plus its own next token, so every em
 
 from __future__ import annotations
 
+import math
 import os
+import struct
 from dataclasses import dataclass
 
 import torch
@@ -18,6 +20,7 @@ from . import kernels as K
 from . import markov as _markov
 from . import model as _model
 from . import rounds as _rounds
+from .graph_keys import CAPTURE_MODE
 from .model import KV_QUANT, Model, attn_in, l2_fork, l2_join, mm, q_proj, wo_a_out, wo_ab
 
 # TF_DS_DRAFT_FUSED=1 (default): the batched drafter graph's stages take the decode round's fused kernels (each
@@ -253,7 +256,7 @@ class DraftGraph:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
+        with torch.cuda.graph(self.graph, pool=pool, capture_error_mode=CAPTURE_MODE):
             self._body()
         torch.cuda.synchronize()
 
@@ -290,13 +293,21 @@ class BatchDraftGraph:
         self.steps = max(1, min(drafter.size, steps or drafter.size))
         dev = "cuda"
         n = drafter.size
-        self.inputs = torch.zeros((3, streams), dtype=torch.long, device=dev)   # one buffer, so one copy fills it
-        self.tokens, self.q0, self.slots = self.inputs.unbind(0)
+        # one buffer, so one copy fills it: tokens, positions, slots, then (coupled drafts) each stream's seed, top_k,
+        # and as float64 bits its divisor (temperature x markov.COUPLED_SCALE; 0: greedy drafts), top_p and ln min_p
+        self.inputs = torch.zeros((8, streams), dtype=torch.long, device=dev)
+        self.tokens, self.q0, self.slots, self.seed, self.top_k, div, top_p, min_log = self.inputs.unbind(0)
+        self.div, self.top_p, self.min_log = (x.view(torch.float64) for x in (div, top_p, min_log))
         self.bidx = (torch.arange(streams, device=dev)[:, None, None] * n +
                      torch.arange(n, device=dev)[None, None, :]).expand(streams, n, n).reshape(streams * n, n).contiguous()
         self.zero = torch.zeros((streams * n,), dtype=torch.long, device=dev)
         self.graph = None
         self.mk = drafter.markov() if streams <= _markov.NP else None
+        # two graphs when the Markov loop couples: with the coupled steps (a round where a stream samples) and
+        # without (no stream samples: today's greedy loop, its time)
+        self.coupled = self.mk is not None and self.mk.couples()
+        self.graphs: dict[bool, torch.cuda.CUDAGraph] = {}
+        self.packs: dict[bool, torch.Tensor] = {}
 
     def _attention(self, lay, x, ring, pos, wpos, rbase, fused=False):
         d, m, c = self.d, self.d.m, self.d.m.cfg
@@ -358,7 +369,7 @@ class BatchDraftGraph:
         l2_join(m)
         return h, pre
 
-    def _body(self):
+    def _body(self, coupled: bool = False):
         d, m, c = self.d, self.d.m, self.d.m.cfg
         N, n = self.N, d.size
         R = N * n
@@ -399,7 +410,8 @@ class BatchDraftGraph:
         if self.mk is not None:
             # markov.py: fixed-order kernels a step (cached bias rows, the vocabulary split over the ranks), every
             # bias the cuBLAS loop's bits: the same drafts
-            self.mk.steps(self.mk.logits_of(local), out, n, steps)
+            samp = (self.seed, self.div, self.top_k, self.q0, self.top_p, self.min_log) if coupled else None
+            self.mk.steps(self.mk.logits_of(local), out, n, steps, samp)
             embs = d.dw.markov_embed[out[:, :steps]]                      # [N, steps, rank]: the rows the steps read
         else:
             logits = m.comm.gather(local).permute(1, 0, 2).reshape(R, -1).view(N, n, -1)
@@ -412,38 +424,59 @@ class BatchDraftGraph:
             embs = torch.stack(embs, 1)
         conf_in = torch.cat([xc.float().view(N, n, -1)[:, :steps], embs.float()], -1)
         conf = (conf_in @ d.dw.conf.float().t())[..., 0]                 # [N, steps]
-        self.packed = torch.cat([out[:, 1:].to(F32), conf], 1)           # [N, 2 steps]: one host read a round
+        self.packs[coupled] = torch.cat([out[:, 1:].to(F32), conf], 1)    # [N, 2 steps]: one host read a round
 
     def capture(self, pool=None):
         m = self.d.m
         m.graph_moe = True                               # 13+ streams: 64+ rows, a MoE scratch the graph keeps
         try:
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                self._body()
-            torch.cuda.current_stream().wait_stream(s)
-            torch.cuda.synchronize()
-            self.graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(self.graph, pool=pool):
-                self._body()
-            torch.cuda.synchronize()
+            for coupled in (False, True) if self.coupled else (False,):
+                s = torch.cuda.Stream()
+                s.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(s):
+                    self._body(coupled)
+                torch.cuda.current_stream().wait_stream(s)
+                torch.cuda.synchronize()
+                g = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(g, pool=pool, capture_error_mode=CAPTURE_MODE):
+                    self._body(coupled)
+                torch.cuda.synchronize()
+                self.graphs[coupled] = g
         finally:
             m.graph_moe = False
+        self.graph = self.graphs[False]
 
-    def run(self, tokens: list[int], q0: list[int], slots: list[int]) -> list[list[int]]:
+    def run(self, tokens: list[int], q0: list[int], slots: list[int], samplings: list | None = None) -> list[list[int]]:
+        """``samplings``: each stream's ``Sampling`` (None or temperature 0: greedy drafts). A round where no stream
+        samples runs the graph without the coupled steps. Every rank holds the same samplings: the same graph, the
+        same gathers."""
+
+        N = self.N
+        seed, top_k, div, top_p, min_log = [0] * N, [0] * N, [0.0] * N, [1.0] * N, [-math.inf] * N
+        if self.coupled:
+            for r, smp in enumerate(samplings or ()):
+                # a rank sends its CAND best: they hold the stream's top_k only for 0 < top_k <= CAND (top_k 0 or
+                # more: greedy drafts)
+                if smp is not None and smp.temperature > 0 and 0 < int(smp.top_k or 0) <= _markov.CAND:
+                    sd = int(smp.seed) & ((1 << 64) - 1)                # the target's 64 bits, as int64
+                    seed[r] = sd - (1 << 64) if sd >> 63 else sd
+                    top_k[r] = int(smp.top_k)
+                    div[r] = max(float(smp.temperature), 1e-6) * _markov.COUPLED_SCALE   # exact_sampling's divisor
+                    top_p[r] = float(smp.top_p) if 0.0 < smp.top_p < 1.0 else 1.0       # choose_rows's rules
+                    min_log[r] = float(smp.min_log)
+        coupled = any(x > 0 for x in div)
+        bits = [list(struct.unpack(f"<{N}q", struct.pack(f"<{N}d", *x))) for x in (div, top_p, min_log)]
+        host = torch.tensor([tokens, q0, slots, seed, top_k, *bits], dtype=torch.long)
         if _rounds.ONE_COPY:
-            self.inputs.copy_(torch.tensor([tokens, q0, slots], dtype=torch.long).pin_memory(), non_blocking=True)
+            self.inputs.copy_(host.pin_memory(), non_blocking=True)
         else:
-            self.tokens.copy_(torch.tensor(tokens, dtype=torch.long))
-            self.q0.copy_(torch.tensor(q0, dtype=torch.long))
-            self.slots.copy_(torch.tensor(slots, dtype=torch.long))
+            self.inputs.copy_(host)
         if self.graph is None:
-            self._body()
+            self._body(coupled)
         else:
-            self.graph.replay()
+            self.graphs[coupled].replay()
         n = self.steps
-        rows = self.packed.tolist()
+        rows = self.packs[coupled].tolist()
         self.last_conf = [row[n:] for row in rows]       # the confidence head's logits, a list a stream
         return [[int(x) for x in row[:n]] for row in rows]
 

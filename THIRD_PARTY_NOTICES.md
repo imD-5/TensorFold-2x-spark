@@ -89,11 +89,25 @@ This section was added by the fork that adds the `deepseek_v41` family; see `NOT
   MIT License, Copyright (c) 2023 DeepSeek, without including that source.
 - The DSML tool-call parsing in `src/tensorfold/cuda/reply_text.py` follows the format that DeepSeek's encoding and
   chat template for the model write (MIT License, Copyright (c) 2023 DeepSeek), without including that source.
+- The containment rules for DSML tool calls (`src/tensorfold/dsml_calls.py`, `reply_text.py`, `tool_draft.py`)
+  follow [ashhart/TensorFold](https://github.com/ashhart/TensorFold) pull requests #684 ("Contain nested calls
+  within legacy DSML envelopes"), #650 and #489 (Apache-2.0, Copyright 2026 TensorFold contributors): a call counts
+  only when its block is complete and well formed at the top level, text in an open block is never a call, and a
+  call inside an argument is argument text. Only the text and diffs of those three pull requests were read, in the
+  server files of the Zig engine outside `families/deepseek_v41/` and `kernels/cuda/deepseek_v41/`. The Python is
+  written for this fork. No code is copied. The block scanner, its depth rule and the strict check of a block's
+  structure are this fork's own.
 - Upstream [vLLM](https://github.com/vllm-project/vllm)'s `deepseek_v41` model code (Apache-2.0, Copyright
   contributors to the vLLM project) was read only as a cross-check of that math. No code is taken from it.
 - The grouped EXL3 expert kernel additions (`src/tensorfold/cuda/exl3/experts_grouped.cuh`, `experts.cu`) follow
   [ExLlamaV3](https://github.com/turboderp-org/exllamav3)'s EXL3 format, MIT License, Copyright (c) 2025 Turboderp
   (text below), as the rest of the shared EXL3 module does.
+- Three host settings follow ideas of the official [TensorFold](https://github.com/ashhart/TensorFold) main branch
+  (Apache-2.0, Copyright 2026 TensorFold contributors), written again in Python without taking its Zig code: NCCL's
+  cuMem allocations off by default (`hostenv.py`; its pull request #995), the RoCE v2 IPv4 GID scan of a port
+  (`src/tensorfold/cuda/roce_gid.py`; the idea of `gidIndex` in `zig/src/cuda/roce.zig`) and the page cache release
+  after a weight load (`hostenv.py`, `weights.py`; its pull requests #766 and #916). None of its DeepSeek-V4.1 files
+  (`families/deepseek_v41/`, `kernels/cuda/deepseek_v41/`) was opened.
 - The baseline used in `tools/dsv41/REPORT.md` (a vLLM kit under AGPL-3.0) was only run as a black box over HTTP. None
   of its code was read or included. `tools/dsv41/ATTRIBUTION.md` lists every source in full.
 

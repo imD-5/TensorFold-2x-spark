@@ -18,6 +18,8 @@ from typing import Any, Callable
 
 import torch
 
+from . import memtrace
+
 PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 512)
 # the RDMA gather's slot in MiB (default 4.25; 8 before): fp32 gathers up to it go over RDMA writes, larger ones over
 # NCCL. Decode's largest is a 16-row vocab-split head (4.14 MB); prefill chunks of 218-409 rows send 4.3-8 MB a gather
@@ -80,6 +82,8 @@ class DsEngine:
         # gather on the CX7 link against 7.1 with NCCL's choice (decode windows go over the RDMA gather)
         os.environ.setdefault("NCCL_PROTO", "Simple")
         os.environ.setdefault("NCCL_MIN_NCHANNELS", "4")
+        if world > 1:
+            self._nccl_host_env()
         nccl = NCCL(rank, world, master, port) if world > 1 else None
         self.nccl = nccl
         self.w = load(model_dir, rank, world, dspark=drafts > 0)
@@ -184,9 +188,20 @@ class DsEngine:
                 print(f"[tensorfold] --parallel {int(parallel)}: {int(parallel)} streams share one window of "
                       f"{self.multi.extents.total} tokens (an extent each)", flush=True)
         self._memory_ceiling()
+        memtrace.start(rank)
         if rank == 0:
             print(f"[tensorfold] DeepSeek-V4.1 engine ready: {world} rank(s), context {self.limit}, "
                   f"{'DSpark ' + str(drafts) + ' drafts' if self.drafter else 'serial decode'}", flush=True)
+
+    def _nccl_host_env(self) -> None:
+        """NCCL's cuMem allocations off and its GID index set (hostenv.py); a value that the user set stays."""
+
+        from .hostenv import apply_nccl_defaults
+
+        done = apply_nccl_defaults()
+        if done:
+            print(f"[tensorfold] rank {self.rank}: NCCL settings by default: "
+                  + " ".join(f"{k}={v}" for k, v in done.items()), flush=True)
 
     def _memory_ceiling(self) -> None:
         """After the warm-up, torch may grow only while the host keeps TF_DS_MEM_FLOOR_GIB (default 2; 0: no ceiling)
@@ -282,10 +297,11 @@ class DsEngine:
         dim = self.w.cfg.dim
         if self.world == 1:
             return rows
-        send = rows.contiguous() if self.rank == 0 else torch.zeros((n, dim), dtype=torch.bfloat16, device="cuda")
-        recv = torch.empty((self.world * n * dim,), dtype=torch.bfloat16, device="cuda")
-        self.nccl.all_gather(send.view(-1), recv)
-        return recv[:n * dim].view(n, dim)
+        with memtrace.phase("share"):
+            send = rows.contiguous() if self.rank == 0 else torch.zeros((n, dim), dtype=torch.bfloat16, device="cuda")
+            recv = torch.empty((self.world * n * dim,), dtype=torch.bfloat16, device="cuda")
+            self.nccl.all_gather(send.view(-1), recv)
+            return recv[:n * dim].view(n, dim)
 
     def _make_draft_graph(self, sc, dc, tok: int, pos: int):
         """A drafter graph bound to one cache pair (a concurrent slot's), captured in the shared graph pool."""

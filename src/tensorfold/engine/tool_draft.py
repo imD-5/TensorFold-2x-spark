@@ -5,9 +5,14 @@ from __future__ import annotations
 import re
 from typing import Any, Sequence
 
+from tensorfold.dsml_calls import DSML_CLOSE, DSML_OPEN, top_level_blocks
 from tensorfold.tool_parameters import decode_parameter, parameter_schemas, typed_parameter
 
 _OPEN = "<tool_call>"
+_VALUE_END = re.compile("</parameter>", re.IGNORECASE)
+# the tags that decide where the top-level blocks are: a text that adds none of them leaves the blocks as they were
+_BLOCK_TAGS = re.compile(f"</?tool_call>|{re.escape(DSML_OPEN)}|{re.escape(DSML_CLOSE)}", re.IGNORECASE)
+_TAG_REACH = len(DSML_CLOSE)
 _END = "\x00end"  # placeholder: after a closed call the draft is the end-of-turn token
 _SINGLE_LINE = re.compile(r"path|file|dir|name|pattern|glob|url|query|id|mode|lang|cwd|limit|offset",
                           re.IGNORECASE)
@@ -261,6 +266,16 @@ class ToolCallStreamer:
         self.lead = False       # the framing newline after <parameter=NAME> has not arrived yet
         self.held = ""
         self.streamed = False
+        self.call_start = -1    # where the call being streamed begins
+        self.completed = 0      # streamed calls whose block closed as the parser sees it
+        self.scan: tuple[int, list, int] | None = None     # (text length, top-level blocks, open block)
+
+    @property
+    def abandoned(self) -> int:
+        """1 when a call was started and its block never closed as the parser sees it, else 0. The client holds
+        its deltas under an index, so the calls that follow it take the next indexes."""
+
+        return self.index + 1 - self.completed
 
     def _args(self, fragment: str) -> dict[str, Any]:
         return {"tool_calls": [{"index": self.index, "function": {"arguments": fragment}}]}
@@ -271,20 +286,53 @@ class ToolCallStreamer:
 
         return json.dumps(text, ensure_ascii=False)[1:-1]
 
+    def _blocks(self, text: str) -> tuple[list, int]:
+        """The top-level blocks of ``text``. The text only grows, so a rescan waits for a new block tag."""
+
+        if self.scan is not None and len(text) >= self.scan[0]:
+            seen, blocks, open_at = self.scan
+            if not any(m.end() > seen for m in _BLOCK_TAGS.finditer(text, max(0, seen - _TAG_REACH))):
+                self.scan = (len(text), blocks, open_at)
+                return blocks, open_at
+        blocks, open_at = top_level_blocks(text)
+        self.scan = (len(text), blocks, open_at)
+        return blocks, open_at
+
+    def _call_start(self, text: str) -> int | None:
+        """Where the next call may start: a <tool_call> tag that is a top-level block, as the final parser counts it.
+
+        A tag inside a DSML block or inside another tag block is never a start, and the tags must match in case.
+        None: no start yet. -1: a block comes first that streaming can not follow, so the final parser decides."""
+
+        blocks, open_at = self._blocks(text)
+        for block in blocks:
+            if block.start < self.pos:
+                continue
+            if block.kind == "dsml" or not text.startswith(_OPEN, block.start):
+                return -1               # its calls come first in the reply and are not streamed
+            return block.start
+        if open_at >= self.pos and text.startswith(_OPEN, open_at):
+            return open_at              # an open top-level block may stream
+        return None
+
     def feed(self, text: str) -> list[dict[str, Any]]:
         import uuid
 
         out: list[dict[str, Any]] = []
         while self.state != "abort":
-            rest = text[self.pos:]
+            rest = text[self.pos:] if self.state != "outside" else ""
             if self.state == "outside":
-                j = rest.find(_OPEN)
-                if j < 0:
+                start = self._call_start(text)
+                if start is None:
                     break
-                self.pos += j + len(_OPEN)
+                if start < 0:
+                    self.state = "abort"            # a top-level block comes first that this streamer cannot follow
+                    break
+                self.call_start = start
+                self.pos = start + len(_OPEN)
                 self.state = "call"
             elif self.state == "call":
-                m = re.match(r"\s*<function=([^>\n]+)>\n?", rest)
+                m = re.match(r"\s*<function=([^>\n]+)>\n?", rest, re.IGNORECASE)
                 if m is None:
                     if len(rest) > 256 or (rest.strip() and not rest.strip().startswith("<")):
                         self.state = "abort"  # not a call we can follow: the end parser decides
@@ -303,7 +351,7 @@ class ToolCallStreamer:
                 self.pos += m.end()
                 self.state = "function"
             elif self.state == "function":
-                m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest)
+                m = re.match(r"\s*<parameter=([^>\n]+)>\n?", rest, re.IGNORECASE)
                 if m is not None:
                     self.value_schema = self.current_schema.get(m.group(1).strip(), {})
                     self.typed = typed_parameter(self.value_schema)
@@ -316,15 +364,16 @@ class ToolCallStreamer:
                     self.lead = not m.group(0).endswith("\n")
                     self.held = ""
                     continue
-                m = re.match(r"\s*</function>", rest)
+                m = re.match(r"\s*</function>", rest, re.IGNORECASE)
                 if m is not None:
-                    out.append(self._args("}" if self.args_open else "{}"))
+                    self.held = "}" if self.args_open else "{}"     # sent when the block closes: a cut block stays invalid
                     self.pos += m.end()
                     self.state = "closing"
                     continue
                 break
             elif self.state == "value":
-                end = rest.find(self._TAIL)
+                tail = _VALUE_END.search(rest)               # in any case, as the parser finds it
+                end = tail.start() if tail else -1
                 chunk = rest[:end] if end >= 0 else rest[:max(0, len(rest) - len(self._TAIL))]
                 self.pos += len(chunk)
                 piece = self.held + chunk
@@ -351,9 +400,16 @@ class ToolCallStreamer:
                 self.pos += len(self._TAIL)
                 self.state = "function"
             elif self.state == "closing":
-                m = re.match(r"\s*</tool_call>", rest)
+                m = re.match(r"\s*</tool_call>", rest, re.IGNORECASE)
                 if m is None:
                     break
+                end = self.pos + m.end()
+                if not any(b.start == self.call_start and b.end == end for b in self._blocks(text)[0]):
+                    self.state = "abort"    # the parser ends this block elsewhere: its call is not complete
+                    break
+                out.append(self._args(self.held))
+                self.completed += 1
+                self.held = ""
                 self.pos += m.end()
                 self.state = "outside"
         return out

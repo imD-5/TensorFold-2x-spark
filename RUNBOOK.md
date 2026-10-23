@@ -213,6 +213,7 @@ to refresh installed metadata and dependencies. Update inside the container when
 | Client cannot connect | Server process, `/health`, base URL and model ID |
 | Two-rank startup waits | Link reachability, rendezvous port, NCCL devices and matching settings |
 | CUDA start stops after `loading …`, GPU idle | `kill -USR1 <pid>` prints every thread's Python stack. A wait in the extension build is a build lock, whose path the start log names: when no other build is running, stop the start, delete the lock and start again |
+| `terminate called without an active exception` as the last log line | SIGTERM came during a prompt (`journalctl -u earlyoom` or `docker stop`). The server now leaves with exit code 0 within `TF_SHUTDOWN_GRACE_S` (default 3) and prints no abort. An image older than this fix prints it |
 
 Unsupported architectures or formats need a family implementation. See [adding a family](docs/recipes/adding-a-family.md)
 or [adding a CUDA family](docs/recipes/adding-a-cuda-family.md); forcing an unsupported checkpoint to load

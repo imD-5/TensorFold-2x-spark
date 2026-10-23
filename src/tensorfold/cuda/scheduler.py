@@ -54,17 +54,25 @@ class Scheduler:
         self.held: tuple | None = None               # a request waiting for memory, admitted before any other
         self.boxes: dict[int, queue.Queue] = {}
         self.yields = 0                              # background streams that gave up their lane
+        self.closing = False                         # close() was called: the live streams finish, then the worker ends
+        self.abandon = False                         # close(drain=False): the worker ends after its current round
         if hasattr(decoder, "arrived"):              # a decoder filling prompts lets a new request in between passes
             decoder.arrived = self.waiting.foreground
         self.thread = threading.Thread(target=self._loop, daemon=True)
         self.thread.start()
 
-    def close(self) -> None:
-        """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now)."""
+    def close(self, timeout: float | None = None, *, drain: bool = True) -> bool:
+        """Stop the worker once idle and let go of the decoder (its thread held it, and its weights, until now).
+        Without ``drain`` it ends after its current round and the live requests get no reply (the process is ending).
+        With ``timeout`` seconds, True if the worker stopped in time; a worker still busy keeps its decoder."""
 
+        self.abandon = not drain
         self.waiting.stop()
-        self.thread.join()
+        self.thread.join(timeout)
+        if self.thread.is_alive():
+            return False
         self.decoder = None
+        return True
 
     def submit(self, prompt: list[int], count: int, sampling: Any, draft: bool,
                emit: Callable[[list[int]], bool | None], stop_eos: bool = True, *, vision: Any = None,
@@ -123,9 +131,13 @@ class Scheduler:
                 (stream, box), self.held = self.held, None
             else:
                 try:
-                    stream, box = self.waiting.get_nowait()
+                    item = self.waiting.get_nowait()
                 except queue.Empty:
                     break
+                if item is None:                     # close()'s mark: it comes after every waiting request
+                    self.closing = True
+                    break
+                stream, box = item
             self.boxes[id(stream)] = box
             try:
                 self.decoder.admit(stream)
@@ -165,8 +177,12 @@ class Scheduler:
 
     def _loop(self) -> None:
         while True:
+            if self.abandon:
+                return
             self._yield()
             idle = not self.decoder.live() and self.held is None
+            if idle and self.closing:
+                return
             first = self.waiting.get() if idle else None                              # idle: wait for a request
             if idle and first is None:
                 return                                                                # close()

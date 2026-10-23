@@ -17,6 +17,11 @@ v6: quiet, the proxy thread naps instead of spinning a core forever. Once TF_RDM
 with nothing staged or completed it sleeps TF_RDMA_NAP_US (default 100) between looks, and the next doorbell or
 completion has it spin again: a decode round's gathers never see a nap, the first gather after a quiet spell waits one
 at most (``RdmaGather.idle_stats``: naps taken, wakes from them).
+
+The GID index of each port is the lowest RoCE v2 IPv4 entry of its GID table, read at start (roce_gid.py): the tables of
+two nodes can differ, and a link flap can move an entry. TF_RDMA_GID_INDEX or NCCL_IB_GID_INDEX with a value of 0 or more
+fixes the index for every port; unset, empty or -1 means "detect".
+v7: v6 with these per-port indices.
 """
 
 from __future__ import annotations
@@ -29,6 +34,8 @@ from pathlib import Path
 
 import torch
 
+from .roce_gid import active_roce_devices, resolve_gid_indices
+
 # TF_RDMA_IDLE_S (default 2; 0: the proxy never naps): the quiet spell after which the proxy naps; TF_RDMA_NAP_US
 # (default 100): a nap
 IDLE_S = max(0.0, float(os.environ.get("TF_RDMA_IDLE_S") or 2.0))
@@ -40,7 +47,7 @@ def _ext():
     from tensorfold.cuda.build import load
 
     here = Path(__file__).parent
-    return load(name="tensorfold_rdma_gather_v6", sources=[str(here / "rdma_gather.cu")],
+    return load(name="tensorfold_rdma_gather_v7", sources=[str(here / "rdma_gather.cu")],
                 extra_cuda_cflags=["-O3"], extra_ldflags=["-libverbs"], verbose=False)
 
 
@@ -52,16 +59,7 @@ def device_names() -> list[str]:
     if named:
         return named
     first = (os.environ.get("NCCL_IB_HCA") or "").strip().lstrip("=^").split(",")[0].split(":")[0].strip()
-    root = Path("/sys/class/infiniband")
-    active = []
-    for d in sorted(p.name for p in root.iterdir()) if root.exists() else []:
-        try:
-            state = (root / d / "ports" / "1" / "state").read_text()
-            layer = (root / d / "ports" / "1" / "link_layer").read_text().strip()
-        except OSError:
-            continue
-        if "ACTIVE" in state and layer == "Ethernet":
-            active.append(d)
+    active = active_roce_devices()
     if first in active:
         active.remove(first)
         active.insert(0, first)
@@ -75,7 +73,6 @@ class RdmaGather:
                  prefix: str = "tf_rdma", devices: list[str] | None = None, gid_index: int | None = None) -> None:
         ext = _ext()
         slots = int(os.environ.get("TF_RDMA_SLOTS") or 4) if slots is None else int(slots)
-        gid = int(os.environ.get("NCCL_IB_GID_INDEX", "5")) if gid_index is None else int(gid_index)
         cpu = int(os.environ.get("TF_RDMA_CPU", "-1"))
         self.ext, self.rank, self.world, self.max_bytes = ext, rank, world, int(max_bytes)
         self.devices = device_names() if devices is None else list(devices)
@@ -83,7 +80,11 @@ class RdmaGather:
         try:
             if slots < 2:
                 raise ValueError(f"TF_RDMA_SLOTS must be at least 2 (got {slots})")
-            self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, gid, cpu, int(IDLE_S * 1e6), NAP_US)
+            gids = resolve_gid_indices(self.devices, fixed=gid_index)
+            for name, (index, how) in zip(self.devices, gids):
+                print(f"[tensorfold] rank {rank}: RDMA GID index of {name} port 1: {index} ({how})", flush=True)
+            self.h = ext.create(rank, world, self.max_bytes, slots, self.devices, [g[0] for g in gids], cpu,
+                                 int(IDLE_S * 1e6), NAP_US)
             info = pickle.dumps((ext.local_info(self.h), slots, self.max_bytes))
         except Exception as exc:           # noqa: BLE001  (published, so every rank refuses together)
             error, info = f"{type(exc).__name__}: {exc}", b""

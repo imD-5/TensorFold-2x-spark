@@ -22,13 +22,20 @@ def test_plain_and_unhinted_requests_pass_unchanged():
     assert DsApp._response_format(text, False) is text                    # a text completion has no template
 
 
-@pytest.mark.parametrize("rf", [{"type": "json_object"}, SCHEMA])
-def test_json_formats_keep_the_grammar_and_add_the_template_block(rf):
+@pytest.mark.parametrize("rf, shown", [({"type": "json_object"}, {"type": "json_object"}),
+                                       (SCHEMA, {"type": "object"})])
+def test_json_formats_keep_the_grammar_and_add_the_template_block(rf, shown):
     body = {**CHAT, "response_format": rf, "chat_template_kwargs": {"x": 1}}
     out = DsApp._response_format(body, True)
     assert out["response_format"] is rf                                    # the engine still enforces it
-    assert out["chat_template_kwargs"] == {"x": 1, "response_format": rf}
+    assert out["chat_template_kwargs"] == {"x": 1, "response_format": shown}
     assert body["chat_template_kwargs"] == {"x": 1}                        # the request is not changed in place
+
+
+@pytest.mark.parametrize("spec", [{"name": "n"}, {"name": "n", "schema": "x"}, "x"])
+def test_a_json_schema_without_an_object_schema_shows_the_request_as_sent(spec):
+    rf = {"type": "json_schema", "json_schema": spec}
+    assert DsApp._response_format({**CHAT, "response_format": rf}, True)["chat_template_kwargs"] == {"response_format": rf}
 
 
 def test_a_clients_own_template_input_stays():
@@ -46,4 +53,4 @@ def test_a_non_object_template_input_is_a_400(kwargs):
 
 def test_null_template_kwargs_count_as_none():
     out = DsApp._response_format({**CHAT, "response_format": SCHEMA, "chat_template_kwargs": None}, True)
-    assert out["chat_template_kwargs"] == {"response_format": SCHEMA}
+    assert out["chat_template_kwargs"] == {"response_format": SCHEMA["json_schema"]["schema"]}

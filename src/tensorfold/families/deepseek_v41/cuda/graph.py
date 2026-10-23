@@ -8,24 +8,15 @@ context bucket (masked past each row's visible count), so the arithmetic of a ro
 
 from __future__ import annotations
 
-import os
 import time
 
 import torch
 
 from ..ops import BF16, F32, fp4_qd
 from . import kernels as K
+from .graph_keys import CAPTURE_MODE, bucket_for, context_buckets
 from .model import (KV_QUANT, RAW, Model, SeqCache, _candidates, apply_candidates, attn_in, l2_fork, l2_join, mm,
                     moe_side, store_rows, wo_a_out)
-
-BUCKET_MIN = int(os.environ.get("TF_DS_BUCKET_MIN") or 1024)
-
-
-def bucket_for(n_tokens: int, cap: int) -> int:
-    b = BUCKET_MIN
-    while b < n_tokens:
-        b *= 2
-    return min(b, max(cap, BUCKET_MIN))
 
 
 class StaticDecoder:
@@ -164,7 +155,7 @@ class StaticDecoder:
         torch.cuda.current_stream().wait_stream(s)
         torch.cuda.synchronize()
         self.graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self.graph, pool=pool):
+        with torch.cuda.graph(self.graph, pool=pool, capture_error_mode=CAPTURE_MODE):
             self._body()
         torch.cuda.synchronize()
 
@@ -213,12 +204,7 @@ class GraphRunner:
     def buckets(self, limit: int, cap: int) -> list[int]:
         """Every context bucket a window ending at or before ``limit`` tokens can use, largest first."""
 
-        out, b = set(), BUCKET_MIN
-        while b < limit:
-            out.add(bucket_for(b, cap))
-            b *= 2
-        out.add(bucket_for(limit, cap))
-        return sorted(out, reverse=True)
+        return context_buckets(limit, cap)
 
     def warm(self, sc: SeqCache, limit: int) -> dict:
         """Capture every graph a request can replay before serving: one row without taps (serial decode) and 2 ..

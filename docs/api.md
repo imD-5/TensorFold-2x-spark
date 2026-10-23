@@ -171,6 +171,22 @@ case, as the parser finds them; without it, only the lowercase tags, as before. 
 block that is hidden while streaming and then kept as text (it does not parse) does not reach a streaming
 client.
 
+On the CUDA server, a DeepSeek-V4.1 DSML call counts only when its `calls` block is complete and well formed at
+the top level of the reply. The block holds invokes and white space only, and each invoke holds parameters and white
+space only. Text in a block that is still open (a `<tool_call>` tag that never closes opens one too) is never a call. A reply that stops inside a DSML `calls` block (`max_tokens`, a
+stop string) loses that open block from `content`, the stream and the whole reply alike, and makes no call from it. The
+text before the block stays, and so do complete `calls` blocks before it (their calls run). `finish_reason` is what the
+engine reports: `length` for a `max_tokens` cut, or `tool_calls` when a complete block before the cut made a call. A reply
+that stops inside a `<tool_call>` block keeps that text, and a `<tool_call>` block in it does not run. A `<tool_call>` block or a DSML block
+inside an argument value is argument text. A block that is not well formed is not a call and keeps its text. This
+holds for the whole reply, for the stream, and with `TF_DROP_UNOFFERED_TOOL_CALLS=1`. A value ends at its closing tag,
+and a complete block of the same kind inside it is skipped; so is a complete `<tool_call>` block inside a `<tool_call>` block. A lone closing tag in a value therefore makes the block
+not well formed, and the call does not run. A streamed XML call closes its arguments only when its `</tool_call>` arrives, so a call
+that stops before it never has complete arguments. When a block that does not count keeps a later call as text,
+the server prints one `WARNING` line for the reply (the reason and the character offset, no reply text) and
+counts it in `tensorfold:tool_calls_suppressed_total{reason=...}` on `/metrics`. The reasons are
+`open_tool_call_tag`, `open_dsml_block` and `ill_formed_dsml_block`.
+
 With `parallel_tool_calls: false`, the server buffers tool deltas until it can return the first valid
 completed call. Prose and reasoning can still stream. Usage counts the entire decoded reply, including
 additional calls omitted from the response. Otherwise both servers stream each Qwen XML call as it is written: a
@@ -310,6 +326,8 @@ over `generation_tokens_total` is the decode rate), all under the `tensorfold:` 
 `tensorfold:` prefix for the metric name. `client_disconnections_total` (requests the client walked away from)
 and `preemptions_total` (background work that gave up a lane to a later request) are published where the
 server counts those events, and never at a fabricated zero.
+`tool_calls_suppressed_total{reason=...}` (replies where a block that does not count kept a later tool call
+as text) appears once the CUDA server has counted one.
 
 ## The Responses API
 

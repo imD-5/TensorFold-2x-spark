@@ -22,6 +22,8 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
+from . import memtrace
+
 TEXT = -1
 IMAGE_START, IMAGE, IMAGE_NEW_LINE, IMAGE_END = range(4)
 PLACEHOLDER = "<｜deepseek_image｜>"
@@ -336,7 +338,8 @@ class DsVision:
                     url = url.get("url") if isinstance(url, dict) else url
                     if not isinstance(url, str) or not url:
                         raise ValueError("an image_url part needs a url")
-                    pictures.append(decode(load_image_bytes(url, self.allow_urls, self.max_bytes), self.cfg))
+                    with memtrace.phase("decode"):
+                        pictures.append(decode(load_image_bytes(url, self.allow_urls, self.max_bytes), self.cfg))
                     texts.append(PLACEHOLDER)
                 elif kind == "text":
                     text = part.get("text")

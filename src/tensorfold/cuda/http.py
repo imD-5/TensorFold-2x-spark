@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 import uuid
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NoReturn
 
 from tensorfold.cuda import health
 from tensorfold.server import anthropic, metrics, responses, token_routes
@@ -29,6 +29,17 @@ def usage_of(result: dict[str, Any]) -> dict[str, Any]:
             "total_tokens": result["prompt_tokens"] + result["completion_tokens"],
             "prompt_tokens_details": {"cached_tokens": result.get("cached_tokens", 0)},
             "completion_tokens_details": {"reasoning_tokens": result.get("reasoning_tokens", 0)}}
+
+
+def unsent_call_deltas(result: dict[str, Any]) -> list[dict[str, Any]]:
+    """The calls of a reply that the stream did not send as deltas, whole. The first ``calls_streamed`` calls were
+    sent. A started call that never closed (``calls_offset``) keeps its index, so these take the next ones."""
+
+    sent, offset = result.get("calls_streamed", 0), result.get("calls_offset", 0)
+    return [{"tool_calls": [{"index": i + offset, "id": call["id"], "type": "function",
+                             "function": {"name": call["function"]["name"],
+                                          "arguments": call["function"]["arguments"]}}]}
+            for i, call in enumerate(result.get("calls") or []) if i >= sent]
 
 
 def _error_message(exc: BaseException) -> str:
@@ -256,13 +267,8 @@ def make_handler(app: App):
                         quiet.join()
                 if result["final"]:
                     emit(result["final"])
-                if result["calls"]:
-                    for i, call in enumerate(result["calls"]):
-                        if i < result.get("calls_streamed", 0):      # sent as deltas already
-                            continue
-                        emit({"tool_calls": [{"index": i, "id": call["id"], "type": "function",
-                                              "function": {"name": call["function"]["name"],
-                                                           "arguments": call["function"]["arguments"]}}]})
+                for call_delta in unsent_call_deltas(result):
+                    emit(call_delta)
                 end = chunk({}, result["finish"])
                 if result.get("stop_sequence") is not None:
                     end["stop_sequence"] = result["stop_sequence"]
@@ -346,22 +352,31 @@ def make_handler(app: App):
     return handler(Handler, app)
 
 
-def serve(app: App, host: str, port: int) -> None:
-    """Serve until interrupted (SIGTERM included)."""
+def serve(app: App, host: str, port: int) -> NoReturn:
+    """Serve until interrupted (SIGTERM included), then end the process (``shutdown.leave``): it does not return."""
 
     import signal
 
+    from tensorfold.cuda import shutdown
+
     def _terminate(signum: int, frame: Any) -> None:
+        shutdown.ignore_signals()                           # one stop is enough: a second signal must not cut in
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _terminate)
+    signal.signal(signal.SIGINT, _terminate)
     server = Server((host, port), make_handler(app))
+    code = 1
     try:
         from contextlib import nullcontext
         auth = getattr(app, "auth", None)
         with auth.signals() if auth is not None else nullcontext():
             server.serve_forever()
+        code = 0
     except KeyboardInterrupt:
-        pass
+        code = 0
     finally:
+        if code:
+            traceback.print_exc()
         server.server_close()
+        shutdown.leave(app, code)

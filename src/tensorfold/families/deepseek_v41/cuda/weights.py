@@ -24,6 +24,26 @@ from tensorfold.cuda.exl3 import experts as exl3_experts
 from tensorfold.cuda.exl3.linear import Exl3Linear
 
 from ..config import Cfg
+from .hostenv import drop_page_cache, meminfo_gib, release_enabled
+
+
+@dataclass
+class DenseLinear:
+    """A dense BF16 matrix. The source layout is [output, input]."""
+
+    weight: torch.Tensor
+
+    @property
+    def n(self) -> int:
+        """The output width."""
+
+        return self.weight.shape[0]
+
+    @property
+    def k(self) -> int:
+        """The input width."""
+
+        return self.weight.shape[1]
 
 
 class Shards:
@@ -35,13 +55,44 @@ class Shards:
     def __init__(self, root: str | Path):
         self.root = Path(root)
         self.entries: dict[str, tuple[Path, int, dict]] = {}
-        for path in sorted(self.root.glob("*.safetensors")):
+        members: dict = {}
+        paths = sorted(self.root.glob("*.safetensors"), key=lambda p: ("override" in p.stem.lower(), p.name))
+        for path in paths:
             with open(path, "rb") as f:
                 size = struct.unpack("<Q", f.read(8))[0]
                 header = json.loads(f.read(size))
             header.pop("__metadata__", None)
+            # Only override files can replace a complete linear group.
+            groups = set()
+            if "override" in path.stem.lower():
+                for name, entry in header.items():
+                    prefix, _, part = name.rpartition(".")
+                    if part == "trellis" or (part == "weight" and entry["dtype"] == "BF16"
+                                             and len(entry["shape"]) == 2
+                                             and f"{prefix}.scale" not in header
+                                             and f"{prefix}.trellis" in self.entries):
+                        groups.add(prefix)
+            for group in groups:
+                branch = members
+                for part in group.split("."):
+                    branch = branch.get(part)
+                    if branch is None:
+                        break
+                if branch is not None:
+                    # None holds exact members; a parent replacement also removes its old child groups.
+                    pending = [branch]
+                    while pending:
+                        old = pending.pop()
+                        for name in old.pop(None, ()):
+                            del self.entries[name]
+                        pending.extend(old.values())
+                        old.clear()
             for name, e in header.items():
                 self.entries[name] = (path, 8 + size, e)
+                branch = members
+                for part in name.split(".")[:-1]:
+                    branch = branch.setdefault(part, {})
+                branch.setdefault(None, set()).add(name)
         self._files: dict[Path, object] = {}
 
     def __contains__(self, name: str) -> bool:
@@ -79,7 +130,11 @@ class Shards:
         return t.reshape(shape)
 
     def close(self) -> None:
+        """Close the files. Their cached pages go back to the node first (``drop_page_cache``): a load reads most of
+        the checkpoint once, and on GB10 the page cache takes memory that the serving process needs."""
+
         for f in self._files.values():
+            drop_page_cache(f.fileno())
             f.close()
         self._files.clear()
 
@@ -198,6 +253,7 @@ class RankCache:
             for f in self.ahead:
                 f.cancel()
             self.pool.shutdown(wait=True)
+            drop_page_cache(self.fd)
             os.close(self.fd)
             if ok and self.i != len(self.index):
                 self.path.unlink(missing_ok=True)
@@ -209,6 +265,7 @@ class RankCache:
                 self.f.write(body + struct.pack("<Q", self.at) + self.MAGIC)
                 self.f.flush()
                 os.fsync(self.f.fileno())
+                drop_page_cache(self.f.fileno())          # (clean after the fsync: the kernel keeps dirty pages)
             self.f.close()
             if ok:
                 os.replace(self.tmp, self.path)
@@ -253,6 +310,14 @@ def _codebook(sh: Shards, prefix: str) -> str:
     return "mul1" if f"{prefix}.mul1" in sh else "mcg" if f"{prefix}.mcg" in sh else "3inst"
 
 
+def is_dense(sh: Shards, prefix: str) -> bool:
+    """True for a BF16 matrix without EXL3 or scale parts."""
+
+    entry = sh.entries.get(f"{prefix}.weight")
+    return (entry is not None and entry[2]["dtype"] == "BF16" and len(entry[2]["shape"]) == 2
+            and f"{prefix}.trellis" not in sh and f"{prefix}.scale" not in sh)
+
+
 def exl3_parts(sh: Shards, prefix: str, cols: tuple[int, int] | None = None, rows: tuple[int, int] | None = None,
                device: str | None = "cuda"):
     """(trellis, suh, svh, codebook) of a group, optionally the output columns or input rows [lo, hi) only (multiples
@@ -289,7 +354,19 @@ def pack_trellises(mats: list) -> list:
     return out
 
 
-def linear(sh: Shards, prefix: str, cols=None, rows=None) -> Exl3Linear:
+def linear(sh: Shards, prefix: str, cols=None, rows=None) -> Exl3Linear | DenseLinear:
+    if is_dense(sh, prefix):
+        key = f"{prefix}|dense|{cols}|{rows}"
+
+        def load() -> torch.Tensor:
+            weight = sh.get(f"{prefix}.weight")
+            if cols is not None:
+                weight = weight[cols[0]:cols[1]]
+            if rows is not None:
+                weight = weight[:, rows[0]:rows[1]]
+            return weight.contiguous()
+
+        return DenseLinear(_kept(sh, key, load).cuda())
     tr, suh, svh, cb = exl3_parts(sh, prefix, cols, rows)
     return Exl3Linear.from_tensors(tr, suh, svh, cb)
 
@@ -309,7 +386,7 @@ class Layer:
     kv_norm: torch.Tensor
     sink: torch.Tensor             # local heads [Hl] f32
     wo_a: list                     # local groups' slices
-    wo_b: Exl3Linear               # local groups' input rows
+    wo_b: Exl3Linear | DenseLinear # local groups' input rows
     comp_wkv: Exl3Linear | None = None
     comp_wgate: Exl3Linear | None = None
     comp_norm: torch.Tensor | None = None
@@ -320,7 +397,8 @@ class Layer:
     gate_w: torch.Tensor | None = None       # [E, d] f32
     gate_b: torch.Tensor | None = None       # [E] f32
     gate_b_vl: torch.Tensor | None = None    # [E] f32: the bias image-span tokens pick experts with (attach_vl_bias)
-    experts: object = None                   # Exl3RoutedExperts: routed + the shared expert as the last entry
+    experts: object = None                   # Exl3RoutedExperts: routed experts, and usually the shared expert
+    shared: tuple | None = None              # (w1, w3, w2) when the shared expert cannot join the EXL3 pack
     engram_wkv: Exl3Linear | None = None     # local hash columns' input rows
     engram_qk: torch.Tensor | None = None    # q_weight * k_weight [hc, d] f32
 
@@ -394,8 +472,8 @@ def load_block(sh: Shards, cfg: Cfg, p: str, i: int, rank: int, world: int, n_ex
     cols = (rank * inter_l, (rank + 1) * inter_l)
     gate, up, down = [], [], []
     cb = None
-    for e in list(range(n_experts)) + ["shared"]:
-        ep = f"{p}.ffn.experts.{e}" if e != "shared" else f"{p}.ffn.shared_experts"
+    for e in range(n_experts):
+        ep = f"{p}.ffn.experts.{e}"
         g = exl3_parts(sh, f"{ep}.w1", cols=cols, device=None)
         u = exl3_parts(sh, f"{ep}.w3", cols=cols, device=None)
         dn = exl3_parts(sh, f"{ep}.w2", rows=cols, device=None)
@@ -404,6 +482,19 @@ def load_block(sh: Shards, cfg: Cfg, p: str, i: int, rank: int, world: int, n_ex
         gate.append(g[:3])
         up.append(u[:3])
         down.append(dn[:3])
+    shared = f"{p}.ffn.shared_experts"
+    shared_parts = (f"{shared}.w1", f"{shared}.w3", f"{shared}.w2")
+    if all(not is_dense(sh, part) and _codebook(sh, part) == cb for part in shared_parts):
+        g = exl3_parts(sh, shared_parts[0], cols=cols, device=None)
+        u = exl3_parts(sh, shared_parts[1], cols=cols, device=None)
+        dn = exl3_parts(sh, shared_parts[2], rows=cols, device=None)
+        assert g[3] == u[3] == dn[3] == cb
+        gate.append(g[:3])
+        up.append(u[:3])
+        down.append(dn[:3])
+    else:
+        lay.shared = (linear(sh, shared_parts[0], cols=cols), linear(sh, shared_parts[1], cols=cols),
+                      linear(sh, shared_parts[2], rows=cols))
     trs = pack_trellises([m[0] for m in gate + up + down])
     E1 = len(gate)
     gate = [(trs[k], m[1].cuda(), m[2].cuda()) for k, m in enumerate(gate)]
@@ -484,6 +575,10 @@ def _load(sh, cfg, model_dir, rank, world, n_layers, log, dspark, t0) -> Weights
                else "the rank cache write failed and was dropped") + ")")
     sh.close()
     _trim()
+    free, cached = meminfo_gib("MemAvailable"), meminfo_gib("Cached")
+    if free is not None and cached is not None:
+        log(f"[tensorfold] rank {rank}: weights loaded, MemAvailable {free:.1f} GiB, page cache {cached:.1f} GiB "
+            f"(page cache release {'on' if release_enabled() else 'off'})")
     return w
 
 
