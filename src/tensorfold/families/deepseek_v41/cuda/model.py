@@ -21,6 +21,9 @@ from ..ops import (BF16, F32, EngramHasher, HostIds, RopeTables, fp4_qd, fp8_qd,
 RAW = 64                            # per-position compressor inputs kept (a verify window rolls back by length alone)
 RING_EXTRA = 16                     # window ring slots beyond the 128-token window (verify windows never clobber)
 KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
+# TF_DS_RS=1 (two ranks): a prompt chunk's attention and MoE partials reach the mHC post as bf16(p0 + p1), from an
+# fp32 reduce-scatter and a bf16 all-gather (Comm.reduced). The same bits as the fp32 gather, 3/4 of its bytes.
+RS = os.environ.get("TF_DS_RS", "0") == "1"
 KERNELS = os.environ.get("TF_DS_KERNELS", "1") != "0"      # 0: the plain-torch phase-1 path (A/B and debugging)
 TIMING = os.environ.get("TF_DS_TIMING", "0") == "1"        # per-section wall times (synchronizing; profiling only)
 # TF_DS_REPLAY_FLOOR=1: a prompt chunk of RING_EXTRA rows or fewer whose window reaches below the bounded replay's cut
@@ -114,6 +117,21 @@ class Comm:
         out = torch.empty((self.world, *x.shape), dtype=x.dtype, device=x.device)
         self.nccl.all_gather(x.view(-1), out.view(-1))
         return out
+
+    def reduced(self, x: torch.Tensor) -> torch.Tensor:
+        """The partials [n, d] the mHC post takes: ``gather(x)`` [world, n, d], or TF_DS_RS on two ranks [1, n, d]
+        bf16 = bf16(p0 + p1) from an fp32 reduce-scatter and a bf16 all-gather (one fp32 add of two operands, the same
+        bits in either order: the same y from 3/4 of the bytes)."""
+
+        rdma = getattr(self.nccl, "rdma", None)
+        if not (RS and self.world == 2 and x.shape[0] % 2 == 0 and x.dtype == F32) or (rdma and rdma.fits(x)):
+            return self.gather(x)
+        x = x.contiguous()
+        half = torch.empty((x.shape[0] // 2, *x.shape[1:]), dtype=F32, device=x.device)
+        self.nccl.reduce_scatter(x.view(-1), half.view(-1))
+        y = torch.empty((1, *x.shape), dtype=BF16, device=x.device)
+        self.nccl.all_gather(half.to(BF16).view(-1), y.view(-1))
+        return y
 
     def sum(self, x: torch.Tensor) -> torch.Tensor:
         """Sum rank partials; NCCL can modify x, so callers must treat x as consumed."""
@@ -1377,7 +1395,7 @@ class Model:
                 pa = self.attention_k(lay, x, sc, start, shared, pos, floor=floor,
                                       kv_done=kv_done and lay.idx == c.n_layers // 2)
             with _T("gather"):
-                g = self.comm.gather(pa)
+                g = self.comm.reduced(pa)
             with _T("hc"):
                 fn, scale, base = lay.hc_ffn
                 if hc_pf:
@@ -1394,7 +1412,7 @@ class Model:
             with _T("moe"):
                 pm = self.moe(lay, x, img=img)
             with _T("gather"):
-                g = self.comm.gather(pm)
+                g = self.comm.reduced(pm)
             with _T("hc"):
                 K.hc_post(g, h, post, comb, h)
             pre, pre_f = pre_f, pre
