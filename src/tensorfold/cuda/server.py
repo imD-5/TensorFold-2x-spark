@@ -650,9 +650,10 @@ class App:
         """The chat prompts' encoded pieces, made once; None for a tokenizer they cannot follow."""
 
         with _MADE:
-            if "_prompt_pieces_made" not in self.__dict__:
-                self.__dict__["_prompt_pieces_made"] = PromptPieces.of(self.tok)
-            return self.__dict__["_prompt_pieces_made"]
+            made = self.__dict__.get("_prompt_pieces_made")
+            if made is None:
+                made = self.__dict__["_prompt_pieces_made"] = PromptPieces.of(self.tok)
+            return made
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""

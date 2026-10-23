@@ -94,8 +94,7 @@ def dsml_block_end(text: str, start: int) -> int:
 
 
 def _named_in_prose(text: str, start: int, end: int) -> bool:
-    """An opening tag written inline in prose: in backticks or quotes, or followed by a space or punctuation. A call
-    begins right after its tag (``{``, ``<function=``, a name or a new line)."""
+    """An opening tag written inline in prose (in backticks or quotes, or before a space or punctuation), not a call."""
 
     before = text[start - 1:start]
     after = text[end:end + 1]

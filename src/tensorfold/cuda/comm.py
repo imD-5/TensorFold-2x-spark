@@ -111,8 +111,7 @@ class NCCL:
                                            NCCL_SUM, self.comm, stream))
 
     def reduce_scatter(self, send: torch.Tensor, recv: torch.Tensor) -> None:
-        """recv [n] <- the sum over the ranks of their send's rank-th block (send [world * n]; ncclSum). On two ranks
-        each element is one fp32 add of two operands, so it has the bits of p0 + p1 in either order."""
+        """recv [n] <- ncclSum over the ranks of their send's rank-th block (send [world * n])."""
 
         if send.numel() != recv.numel() * self.world or send.dtype != recv.dtype:
             raise ValueError("reduce_scatter: send must hold world x recv of the same dtype")

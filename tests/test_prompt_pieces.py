@@ -17,10 +17,7 @@ WORDS = ["a", "b", " ", "  ", "\n", "\n\n", "\t", "1", "12", "1234", "日本", "
 
 
 def tokenizer(**mark) -> Tokenizer:
-    """A byte-level BPE like DeepSeek's (digits split first) with a normalizer, special and plain added tokens.
-
-    ``mark`` sets the flags of the plain token ``MARK``; ``TOOL`` and ``CALL`` overlap, and ``"call"`` matches only
-    after normalization."""
+    """A byte-level BPE like DeepSeek's, with a normalizer and added tokens; ``mark`` sets the flags of ``MARK``."""
 
     tok = Tokenizer(models.BPE())
     tok.normalizer = normalizers.Lowercase()

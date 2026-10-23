@@ -126,11 +126,9 @@ class Comm:
         return out
 
     def reduced(self, x: torch.Tensor) -> torch.Tensor:
-        """A prompt chunk's fp32 partials [n, d] for the mHC post kernels, which add the ranks' rows and round to bf16.
-
-        Default: ``gather(x)``, [world, n, d] fp32. TF_DS_RS on two ranks: [1, n, d] bf16 = bf16(p0 + p1), from an fp32
-        reduce-scatter and a bf16 all-gather. One fp32 add of two operands has the same bits in either order, so the
-        kernels form the same y, and the link carries 3/4 of the bytes. Rows the RDMA gather holds keep it."""
+        """The partials [n, d] the mHC post takes: ``gather(x)`` [world, n, d], or TF_DS_RS on two ranks [1, n, d]
+        bf16 = bf16(p0 + p1) from an fp32 reduce-scatter and a bf16 all-gather (one fp32 add of two operands, the same
+        bits in either order: the same y from 3/4 of the bytes)."""
 
         rdma = getattr(self.nccl, "rdma", None)
         if not (RS and self.world == 2 and x.shape[0] % 2 == 0 and x.dtype == F32) or (rdma and rdma.fits(x)):
