@@ -1,7 +1,9 @@
-"""Comm.reduced (TF_DS_RS): a prompt chunk's partials as bf16(p0 + p1) from a reduce-scatter and a bf16 all-gather,
-the same bits as the y the mHC post kernels form from the fp32 gather; the gather itself where it does not apply."""
+"""Comm.reduced (TF_DS_RS): two ranks get bf16(p0 + p1), the y the mHC post kernels form from the fp32 gather, and
+the gather itself where the reduce-scatter does not apply."""
 
 from __future__ import annotations
+
+import threading
 
 import pytest
 import torch
@@ -11,74 +13,89 @@ pytest.importorskip("triton")
 from tensorfold.families.deepseek_v41.cuda import model as M  # noqa: E402
 
 
-class TwoRanks:
-    """One rank's view of a two-rank NCCL whose peer holds ``peer`` (the same collective on both ranks)."""
+class Link:
+    """Two ranks' collectives on the host: each call waits for both ranks' buffers, as NCCL does."""
 
-    def __init__(self, rank: int, mine: torch.Tensor, peer: torch.Tensor):
-        self.rank, self.world, self.calls = rank, 2, []
-        self.p = (mine, peer) if rank == 0 else (peer, mine)
+    def __init__(self):
+        self.barrier, self.sends, self.calls = threading.Barrier(2), [None, None], []
+
+    def swap(self, rank, send):
+        self.sends[rank] = send.clone()
+        self.barrier.wait()
+        both = list(self.sends)
+        self.barrier.wait()
+        return both
+
+
+class Rank:
+    def __init__(self, link, rank, rdma=None):
+        self.link, self.rank, self.world = link, rank, 2
+        if rdma is not None:
+            self.rdma = rdma
 
     def reduce_scatter(self, send, recv):
-        self.calls.append("reduce_scatter")
-        full = (self.p[1] + self.p[0]).reshape(-1)          # the peer's add order: the same bits
-        recv.copy_(full.view(2, -1)[self.rank])
+        a, b = self.link.swap(self.rank, send)
+        self.link.calls.append(("reduce_scatter", self.rank))
+        recv.copy_((a + b).view(2, -1)[self.rank])                  # ncclSum of two operands
 
     def all_gather(self, send, recv):
-        self.calls.append(("all_gather", send.dtype))
-        if send.dtype == torch.bfloat16:                  # the halves of bf16(p0 + p1), rank order
-            halves = (self.p[0] + self.p[1]).to(torch.bfloat16).reshape(-1).view(2, -1)
-            recv.copy_(torch.cat([halves[0], halves[1]]))
-        else:
-            recv.copy_(torch.cat([self.p[0].reshape(-1), self.p[1].reshape(-1)]))
+        a, b = self.link.swap(self.rank, send)
+        self.link.calls.append(("all_gather", send.dtype))
+        recv.copy_(torch.cat([a, b]))
 
 
-def comm(rank, mine, peer, rdma_bytes=0):
-    c = M.Comm.__new__(M.Comm)
-    c.nccl, c.world, c.rdma_bytes, c._buf = TwoRanks(rank, mine, peer), 2, rdma_bytes, {}
-    return c
+class Fits:
+    def fits(self, x):
+        return True
+
+
+def both_ranks(p0, p1, rdma=None):
+    """Comm.reduced on two threads, one a rank: (rank 0's result, rank 1's result, the calls)."""
+
+    link, out = Link(), [None, None]
+
+    def run(rank, mine):
+        c = M.Comm.__new__(M.Comm)
+        c.nccl, c.world, c._buf = Rank(link, rank, rdma), 2, {}
+        out[rank] = c.reduced(mine)
+
+    ts = [threading.Thread(target=run, args=(r, p)) for r, p in ((0, p0), (1, p1))]
+    for t in ts:
+        t.start()
+    for t in ts:
+        t.join()
+    return out[0], out[1], link.calls
 
 
 def parts(n=8, d=64, seed=0):
     g = torch.Generator().manual_seed(seed)
-    return (torch.randn((n, d), generator=g) * 3, torch.randn((n, d), generator=g) * 1e-3)
+    return torch.randn((n, d), generator=g) * 3, torch.randn((n, d), generator=g) * 1e-3
 
 
-@pytest.fixture
-def rs(monkeypatch):
+def test_both_ranks_get_the_posts_y(monkeypatch):
     monkeypatch.setattr(M, "RS", True)
-
-
-@pytest.mark.parametrize("rank", [0, 1])
-def test_bits_are_the_posts_y(rs, rank):
     p0, p1 = parts()
-    mine, peer = (p0, p1) if rank == 0 else (p1, p0)
-    c = comm(rank, mine, peer)
-    y = c.reduced(mine)
-    assert y.shape == (1, *p0.shape) and y.dtype == torch.bfloat16
-    want = (p0 + p1).to(torch.bfloat16)                   # what _hc_post / _hc_mix_pf form from the gather
-    assert torch.equal(y[0].view(torch.int16), want.view(torch.int16))
-    assert c.nccl.calls == ["reduce_scatter", ("all_gather", torch.bfloat16)]
+    y0, y1, calls = both_ranks(p0, p1)
+    want = (p0 + p1).to(torch.bfloat16)[None]                    # what _hc_post forms from the gather, before the mix
+    for y in (y0, y1):
+        assert y.dtype == torch.bfloat16 and torch.equal(y.view(torch.int16), want.view(torch.int16))
+    assert sorted(c[0] for c in calls) == ["all_gather", "all_gather", "reduce_scatter", "reduce_scatter"]
+    assert all(c[1] == torch.bfloat16 for c in calls if c[0] == "all_gather")
 
 
-def test_the_post_reads_the_same_y():
-    """The kernels' y from either input: WORLD fp32 loads summed then cast, or one bf16 load cast (a no-op)."""
-
-    p0, p1 = parts(seed=1)
-    from_gather = (p0 + p1).to(torch.bfloat16).to(torch.float32)
-    from_reduced = (p0 + p1).to(torch.bfloat16)[None][0].to(torch.bfloat16).to(torch.float32)
-    assert torch.equal(from_gather, from_reduced)
-
-
-@pytest.mark.parametrize("case", ["off", "odd rows", "rdma sized", "one rank"])
+@pytest.mark.parametrize("case", ["off", "odd rows", "rdma holds it"])
 def test_falls_back_to_the_gather(monkeypatch, case):
     monkeypatch.setattr(M, "RS", case != "off")
     p0, p1 = parts(n=7 if case == "odd rows" else 8)
-    c = comm(0, p0, p1, rdma_bytes=p0.numel() * 4 if case == "rdma sized" else 0)
-    if case == "one rank":
-        c.world = 1
-        assert torch.equal(c.reduced(p0), p0[None])
-        return
-    g = c.reduced(p0)
-    assert g.dtype == torch.float32 and g.shape == (2, *p0.shape)
-    assert torch.equal(g[0], p0) and torch.equal(g[1], p1)
-    assert c.nccl.calls == [("all_gather", torch.float32)]
+    y0, y1, calls = both_ranks(p0, p1, Fits() if case == "rdma holds it" else None)
+    for y in (y0, y1):
+        assert y.dtype == torch.float32 and torch.equal(y, torch.stack([p0, p1]))
+    assert [c[0] for c in calls] == ["all_gather", "all_gather"]
+
+
+def test_one_rank_is_the_gather(monkeypatch):
+    monkeypatch.setattr(M, "RS", True)
+    c = M.Comm.__new__(M.Comm)
+    c.nccl, c.world, c._buf = None, 1, {}
+    p0, _ = parts()
+    assert torch.equal(c.reduced(p0), p0[None])

@@ -26,8 +26,8 @@ KV_QUANT = os.environ.get("TF_DS_KV", "native") != "bf16"
 # the slot's previous request's keys sit below the floor (prompts of 2048k+112..127 tokens, last chunks of 2-16 rows
 # answered by what ran before). Off (default): the lane's bits. The Zig port's 65f295ec, the same rule.
 REPLAY_FLOOR = os.environ.get("TF_DS_REPLAY_FLOOR", "0") == "1"
-# TF_DS_RS=1: a prompt chunk's attention / MoE partials reach the mHC post as bf16(p0 + p1) from a fp32 reduce-scatter
-# and a bf16 all-gather (Comm.reduced), not as the fp32 gather: the same bits, 3/4 of the bytes on the link
+# TF_DS_RS=1 (two ranks): a prompt chunk's attention and MoE partials reach the mHC post as bf16(p0 + p1), from an
+# fp32 reduce-scatter and a bf16 all-gather (Comm.reduced). The same bits as the fp32 gather, 3/4 of its bytes.
 RS = os.environ.get("TF_DS_RS", "0") == "1"
 
 
@@ -103,7 +103,7 @@ class Comm:
     """Sum partials through RDMA gather, two-rank NCCL in place, or a rank-order sum of gathered values."""
 
     def __init__(self, nccl, world: int, rdma_bytes: int = 0):
-        self.nccl, self.world, self.rdma_bytes = nccl, world, rdma_bytes
+        self.nccl, self.world = nccl, world
         self._buf: dict = {}
         if world > 1 and rdma_bytes and os.environ.get("TF_DS_RDMA", "1") != "0":
             from tensorfold.cuda.rdma import Hybrid, RdmaGather
@@ -126,16 +126,17 @@ class Comm:
         return out
 
     def reduced(self, x: torch.Tensor) -> torch.Tensor:
-        """A prompt chunk's fp32 partials [n, d] for the mHC post kernels: ``gather(x)`` [world, n, d], or with
-        TF_DS_RS on two ranks (rows over the RDMA slot, n even) [1, n, d] bf16 = bf16(p0 + p1), the y those kernels
-        compute from the gather (two-operand fp32 adds have the same bits in either order), from a fp32 reduce-scatter
-        of the rows and a bf16 all-gather: 3/4 of the gather's bytes on the link, 1/4 of its bytes read by the post."""
+        """A prompt chunk's fp32 partials [n, d] for the mHC post kernels, which add the ranks' rows and round to bf16.
 
-        n = x.shape[0]
-        if not (RS and self.world == 2 and n % 2 == 0 and x.dtype == F32 and x.numel() * 4 > self.rdma_bytes):
+        Default: ``gather(x)``, [world, n, d] fp32. TF_DS_RS on two ranks: [1, n, d] bf16 = bf16(p0 + p1), from an fp32
+        reduce-scatter and a bf16 all-gather. One fp32 add of two operands has the same bits in either order, so the
+        kernels form the same y, and the link carries 3/4 of the bytes. Rows the RDMA gather holds keep it."""
+
+        rdma = getattr(self.nccl, "rdma", None)
+        if not (RS and self.world == 2 and x.shape[0] % 2 == 0 and x.dtype == F32) or (rdma and rdma.fits(x)):
             return self.gather(x)
         x = x.contiguous()
-        half = torch.empty((n // 2, *x.shape[1:]), dtype=F32, device=x.device)
+        half = torch.empty((x.shape[0] // 2, *x.shape[1:]), dtype=F32, device=x.device)
         self.nccl.reduce_scatter(x.view(-1), half.view(-1))
         y = torch.empty((1, *x.shape), dtype=BF16, device=x.device)
         self.nccl.all_gather(half.to(BF16).view(-1), y.view(-1))
