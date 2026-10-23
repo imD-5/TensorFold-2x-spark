@@ -17,6 +17,7 @@ from tensorfold.server.cancellation import RequestCancelled
 from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.probabilities import TokenBytes, probability_options
+from tensorfold.server.prompt_pieces import PromptPieces
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
@@ -284,7 +285,8 @@ class App:
                                        self.sampling_for(body, rendered.tokens), ignore_eos=ignore_eos, stop=stop,
                                        vision=rendered.vision, grammar=compiled, think_budget=budget)
             text = render(body["messages"])
-            prompt = self._encode(text, False)
+            pieces = self._prompt_pieces()
+            prompt = self._encode(text, False) if pieces is None else pieces.ids(text)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
@@ -603,6 +605,14 @@ class App:
                 "prompt_tokens": len(prompt), "completion_tokens": len(out), "cached_tokens": (cached or [0])[0],
                 "reasoning_tokens": reasoning_count(out, self.tok.token_to_id("</think>") if chat and thinking else None),
                 "stats": stats, "calls_streamed": streamed}
+
+    def _prompt_pieces(self) -> PromptPieces | None:
+        """The chat prompts' encoded pieces, made once; None for a tokenizer they cannot follow."""
+
+        with _MADE:
+            if "_prompt_pieces_made" not in self.__dict__:
+                self.__dict__["_prompt_pieces_made"] = PromptPieces.of(self.tok)
+            return self.__dict__["_prompt_pieces_made"]
 
     def _turns(self) -> Turns:
         """The engine's turns (one request at a time, background ones last), made on first use."""
