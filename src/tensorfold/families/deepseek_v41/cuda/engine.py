@@ -20,7 +20,9 @@ import torch
 
 from . import memtrace
 
-PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 512)
+# a prompt fills in chunks of this many rows: 4096 measured 28.14 s against 30.87 s for 2048 on a cold 64K prompt (two
+# GB10), and 8192 overruns the allocator ceiling inside the MoE (exl3/experts.py:505)
+PREFILL_CHUNK = int(os.environ.get("TF_DS_PREFILL_CHUNK") or 4096)
 # the RDMA gather's slot in MiB (default 4.25; 8 before): fp32 gathers up to it go over RDMA writes, larger ones over
 # NCCL. Decode's largest is a 16-row vocab-split head (4.14 MB); prefill chunks of 218-409 rows send 4.3-8 MB a gather
 # (over NCCL at 4.25). Pinned host memory a rank: slot x TF_RDMA_SLOTS x (1 + world) (4.25 MiB x 4 x 3 = 51 MiB; 96 at 8)
