@@ -24,6 +24,7 @@ from tensorfold.server.cancellation import RequestCancelled, socket_cancellation
 from tensorfold.server import metrics
 from tensorfold.server.stacks import Rearming
 from tensorfold.server.request_body import read_body
+from tensorfold.server.memtrim import trim
 
 # TENSORFOLD_REQUEST_LOG=path appends every request body (one JSON a line), for exact replays of real traffic
 _REQUEST_LOG = os.environ.get("TENSORFOLD_REQUEST_LOG", "")
@@ -191,6 +192,12 @@ def make_handler(app: Any) -> type[BaseHTTPRequestHandler]:
             responses.delete(self, app, responses.route(self._route()))
 
         def do_POST(self) -> None:
+            try:
+                self._do_post()
+            finally:
+                trim()                      # TF_TRIM=1: what this request freed goes back to the OS
+
+        def _do_post(self) -> None:
             route = self._route()
             if route.endswith("/decisions"):
                 return self._post_decisions(app)
