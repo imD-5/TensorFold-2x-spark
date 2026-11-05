@@ -18,6 +18,7 @@ from tensorfold.server.errors import CONTEXT_LIMIT, RequestError, refusal
 from tensorfold.server.messages import validate_modalities
 from tensorfold.server.plain_text import PlainText
 from tensorfold.server.probabilities import TokenBytes, probability_options
+from tensorfold.server.prompt_pieces import PromptPieces
 from tensorfold.server.request_options import heard_effort, parse_numbers, thinking_fields
 from tensorfold.server.stopping import matched_stop, stop_options
 from tensorfold.server.thinking_notes import unanswered
@@ -117,6 +118,15 @@ class App:
             if made is None:
                 made = self.__dict__["_plain_text_made"] = PlainText(
                     self.tok, assistant_keep=self.plain_assistant_keep)
+            return made
+
+    def _prompt_pieces(self) -> PromptPieces | None:
+        """The chat prompts' encoded pieces, made once; None for a tokenizer they cannot follow."""
+
+        with _MADE:
+            made = self.__dict__.get("_prompt_pieces_made")
+            if made is None:
+                made = self.__dict__["_prompt_pieces_made"] = PromptPieces.of(self.tok)
             return made
 
     @property
@@ -322,7 +332,8 @@ class App:
                 prompt = plain.encode(text, shield)
             else:
                 text = render(body["messages"])
-                prompt = self._encode(text, False)
+                pieces = self._prompt_pieces()
+                prompt = self._encode(text, False) if pieces is None else pieces.ids(text)
         elif isinstance(body.get("prompt"), list):       # token ids (vLLM's and OpenAI's form): served as given
             prompt = self.token_ids(body["prompt"])
         else:
