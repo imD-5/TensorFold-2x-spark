@@ -17,6 +17,8 @@ DSML_OPEN, DSML_CLOSE = f"<{DSML} calls>", f"</{DSML} calls>"
 _INVOKE_RE = re.compile(rf'<{re.escape(DSML)} invoke name="([^"]+)">')
 _PARAM_RE = re.compile(rf'<{re.escape(DSML)} parameter name="([^"]+)"(?: string="(true|false)")?>')
 _SPACE_RE = re.compile(r"\s*")
+# A following prose word proves a reference; an unfinished name or parameter tag does not.
+_PROSE_TAG_RE = re.compile(r"[ \t]+tags?(?![\w.:-])(?=[ \t]+[^\W\d_])")
 
 
 def _pair(open_tag: str, close_tag: str, flags: int = 0) -> tuple[re.Pattern, re.Pattern]:
@@ -98,6 +100,17 @@ def dsml_block_end(text: str, start: int) -> int:
     return closed.end() if closed else -1
 
 
+def _named_in_prose(text: str, start: int, end: int) -> bool:
+    """Accept a quoted tag, punctuation or an explicit tag reference; white space alone is not prose."""
+
+    before = text[start - 1:start]
+    after = text[end:end + 1]
+    quoted = bool(before) and before in "`'\"" and after == before
+    reference = _PROSE_TAG_RE.match(text, end) is not None
+    # A period or colon can start a GLM tool name, so it is not enough to prove prose.
+    return quoted or reference or bool(after) and after in ",;!?)"
+
+
 def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], int]:
     """(the closed blocks at the top level, in order; where the first open block begins, or -1).
 
@@ -117,6 +130,10 @@ def top_level_blocks(text: str, *, any_case: bool = True) -> tuple[list[Block], 
         if tag is None and dsml < 0:
             return blocks, -1
         if tag is not None and (dsml < 0 or tag.start() < dsml):
+            if _named_in_prose(text, tag.start(), tag.end()):
+                # A literal tag reference cannot take a closing tag from later reply text.
+                pos = tag.end()
+                continue
             closer = _close_of(text, tag.end(), tag_tags)
             if closer is None:
                 return blocks, tag.start()

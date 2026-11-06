@@ -61,8 +61,9 @@ def release_enabled(env: Mapping[str, str] | None = None) -> bool:
     return (env.get(RELEASE_VAR) or "1").strip().lower() not in ("0", "off", "false", "no")
 
 
-def drop_page_cache(target, *, env: Mapping[str, str] | None = None) -> bool:
-    """Ask the kernel to drop the cached pages of a file: ``target`` is an open file descriptor or a path.
+def drop_page_cache(target, offset: int = 0, length: int = 0, *, env: Mapping[str, str] | None = None) -> bool:
+    """Ask the kernel to drop the cached pages of a file, or of ``length`` bytes from ``offset`` (0: to the end):
+    ``target`` is an open file descriptor or a path.
 
     The call is a hint: the kernel keeps dirty pages and pages that another process maps. It returns True when the
     kernel took the request, and False when the switch is off, the system has no ``posix_fadvise`` or the call failed.
@@ -74,11 +75,11 @@ def drop_page_cache(target, *, env: Mapping[str, str] | None = None) -> bool:
         return False
     try:
         if isinstance(target, int):
-            advise(target, 0, 0, flag)
+            advise(target, offset, length, flag)
         else:
             fd = os.open(target, os.O_RDONLY)
             try:
-                advise(fd, 0, 0, flag)
+                advise(fd, offset, length, flag)
             finally:
                 os.close(fd)
     except OSError:
