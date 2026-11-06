@@ -126,6 +126,8 @@ class Shards:
             if not n:
                 raise IOError(f"short read of {name}")
             got += n
+        if buf:                                       # A zero advice length means the rest of the file.
+            drop_page_cache(f.fileno(), base + lo, hi - lo)
         t = torch.frombuffer(buf, dtype=dt) if buf else torch.empty(0, dtype=dt)
         return t.reshape(shape)
 
@@ -220,6 +222,8 @@ class RankCache:
             if k <= 0:
                 raise IOError(f"short read of {self.path}")
             got += k
+        if n:                                         # A zero advice length means the rest of the file.
+            drop_page_cache(self.fd, off, n)
         return buf
 
     def take(self, key: str) -> torch.Tensor:

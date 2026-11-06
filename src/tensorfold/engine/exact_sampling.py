@@ -68,12 +68,18 @@ def default_seed(prompt: Sequence[int], seed: Any = None) -> int:
     return seed_random() if SEED_MODE == "random" else seed_for(prompt)
 
 
+CHUNK = 4096                # tokens a slice: seed_for feeds the same bytes to the hash, one slice at a time
+
+
 def seed_for(tokens: Sequence[int], salt: int | None = None) -> int:
     """A reproducible seed from the prompt: the same conversation samples the same reply (for one salt)."""
 
     salt = SEED_SALT if salt is None else salt
-    digest = hashlib.sha256((",".join(str(int(t)) for t in tokens) + f"|{salt}").encode()).digest()
-    return int.from_bytes(digest[:8], "little") & ((1 << 63) - 1)
+    digest = hashlib.sha256()
+    for at in range(0, len(tokens), CHUNK):
+        digest.update((("," if at else "") + ",".join(str(int(t)) for t in tokens[at:at + CHUNK])).encode())
+    digest.update(f"|{salt}".encode())
+    return int.from_bytes(digest.digest()[:8], "little") & ((1 << 63) - 1)
 
 
 def _mix(x: np.ndarray) -> np.ndarray:
